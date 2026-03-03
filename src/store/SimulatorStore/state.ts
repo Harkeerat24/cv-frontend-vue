@@ -27,6 +27,7 @@ export interface State {
         save_project_dialog: boolean
         open_project_dialog: boolean
         export_project_dialog: boolean
+        export_canonical_dialog: boolean
         import_project_dialog: boolean
     }
     combinationalAnalysis: Object
@@ -61,6 +62,7 @@ export const useState = defineStore({
                 save_project_dialog: false,
                 open_project_dialog: false,
                 export_project_dialog: false,
+                export_canonical_dialog: false,
                 import_project_dialog: false,
             },
             combinationalAnalysis: {

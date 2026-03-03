@@ -19,6 +19,7 @@ import { generateVerilog } from './verilog'
 import { bitConverterDialog } from './utils'
 import { keyBinder } from '#/components/DialogBox/CustomShortcut.vue'
 import { ExportProject } from '#/components/DialogBox/ExportProject.vue'
+import { ExportCanonical } from '#/components/DialogBox/ExportCanonical.vue'
 import { ImportProject } from '#/components/DialogBox/ImportProject.vue'
 
 const logixFunction = {}
@@ -42,6 +43,7 @@ logixFunction.bitconverter = bitConverterDialog
 logixFunction.createNewCircuitScope = createNewCircuit
 logixFunction.customShortcut = keyBinder
 logixFunction.ExportProject = ExportProject
+logixFunction.ExportCanonical = ExportCanonical
 logixFunction.ImportProject = ImportProject
 export default logixFunction
 
