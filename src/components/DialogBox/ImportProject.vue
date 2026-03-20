@@ -29,7 +29,7 @@
                         center-affix
                         :error-messages="errorMessage"
                         max-errors="1"
-                        accept=".cv"
+                        accept=".cv,.json"
                         v-model="file"
                         prepend-icon="mdi-paperclip"
                     >
@@ -67,6 +67,7 @@
 import { generateSaveData } from '#/simulator/src/data/save'
 import { escapeHtml } from '#/simulator/src/utils'
 import load from '#/simulator/src/data/load'
+import { importCanonical } from '#/simulator/src/data/importCanonical'
 import { useState } from '#/store/SimulatorStore/state'
 import { useProjectStore } from '#/store/projectStore'
 import { ref } from 'vue'
@@ -109,7 +110,7 @@ function addDropFile(e: DragEvent) {
         const droppedFile = e.dataTransfer?.files[0]
         const fileExtension = droppedFile.name.split('.').pop()
 
-        if (fileExtension === 'cv') {
+        if (fileExtension === 'cv' || fileExtension === 'json') {
             file.value[0] = droppedFile
             document
                 .querySelector('.fileInput')
@@ -118,7 +119,7 @@ function addDropFile(e: DragEvent) {
         } else {
             document.querySelector('.fileInput')?.classList.add('error--text')
             errorMessage.value =
-                'Invalid file format. Only [ .cv ] files are accepted. Try again.'
+                'Invalid file format. Only [ .cv ] or [ .json ] files are accepted. Try again.'
         }
     }
 }
@@ -146,8 +147,18 @@ function ValidateData(fileData: string) {
     }
 }
 
-async function receivedText(fileContent: string) {
+async function receivedText(fileContent: string, fileName: string) {
     // receive file content
+    const fileExtension = fileName.split('.').pop()
+
+    if (fileExtension === 'json') {
+        const parsedFileData = JSON.parse(fileContent)
+        const activeScope = (window as any).globalScope
+        await importCanonical(parsedFileData, activeScope)
+        SimulatorState.dialogBox.import_project_dialog = false
+        return
+    }
+
     const backUp = JSON.parse(
         (await generateSaveData(
             escapeHtml(projectStore.getProjectName || 'untitled').trim(),
@@ -166,7 +177,7 @@ function readFile() {
     const importFile = file.value[0]
     const reader = new FileReader()
     reader.onload = function () {
-        receivedText(reader.result as string) // Pass the file content to receivedText
+        receivedText(reader.result as string, importFile.name) // Pass the file content to receivedText
     }
     reader.readAsText(importFile)
 }
