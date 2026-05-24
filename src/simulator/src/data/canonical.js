@@ -47,6 +47,190 @@ function buildNodeIndexMap(allNodes) {
     return map
 }
 
+// Small, fast non-cryptographic hash (FNV-1a) used for WL signatures.
+// Reason: 1-WL runs many hashes in a hot loop; we prefer speed over
+// cryptographic strength here. Returned string is stable across runs.
+function fnv1aHash(text) {
+    let hash = 0x811c9dc5
+
+    for (let i = 0; i < text.length; i++) {
+        hash ^= text.charCodeAt(i)
+        hash = Math.imul(hash, 0x01000193) >>> 0
+    }
+
+    return `fnv1a_${hash.toString(16).padStart(8, '0')}`
+}
+
+// Normalise access to a component's connection map. The exporter uses
+// `_connections` (internal) but the WL POC/test may pass `connections`.
+function getComponentConnections(comp) {
+    return comp.connections || comp._connections || {}
+}
+
+// Produce a deterministic JSON string of the component's port->net map
+// with keys sorted. This mirrors the topology fingerprint used elsewhere
+// (but without labels or runtime ids) and is used in initial fingerprinting.
+function getComponentFingerprint(comp) {
+    const connections = getComponentConnections(comp)
+    return JSON.stringify(
+        Object.keys(connections)
+            .sort()
+            .map(key => [key, connections[key]])
+    )
+}
+
+// Map raw signatures (hash strings) to compact canonical colour tokens.
+// We sort unique signatures so tokens are deterministic across runs.
+function relabelWlSignatures(signatureMap) {
+    const uniqueSignatures = [...new Set(signatureMap.values())].sort()
+    const colourBySignature = new Map(
+        uniqueSignatures.map((signature, index) => [
+            signature,
+            `wl_${String(index).padStart(4, '0')}`,
+        ])
+    )
+
+    const colours = new Map()
+    for (const [comp, signature] of signatureMap) {
+        colours.set(comp, colourBySignature.get(signature))
+    }
+
+    return colours
+}
+
+// wlFingerprint: implement 1-dimensional Weisfeiler-Leman on the provided
+// subset of components. Important properties:
+// - Operates only on the tied subset (C_tied) to keep cost low.
+// - Builds adjacency by shared net IDs (values of the connections map).
+// - Round-0 uses structural-only features (type|bitWidth|portCount).
+// - Each round: newSig = hash(ownColour + sorted(neighbourColours)).
+// - Signature relabelling maps distinct signatures to ordered tokens
+//   (wl_0000, wl_0001, ...). Early exit on convergence.
+export function wlFingerprint(components, maxIterations = 15) {
+    const result = new Map()
+
+    if (!components || components.length === 0) {
+        return result
+    }
+
+    // adjacency map: component -> Set(neighbour components)
+    const adjacency = new Map()
+    const netToComponents = new Map()
+    const shouldTrace =
+        typeof process !== 'undefined' &&
+        process.env?.NODE_ENV === 'test' &&
+        components.length <= 3
+
+    for (let i = 0; i < components.length; i++) {
+        adjacency.set(components[i], new Set())
+    }
+
+    // Group components by net id (skip nulls). Components sharing a net
+    // become neighbours. Multiple shared nets do not create duplicate
+    // adjacency thanks to the Set per node.
+    for (let i = 0; i < components.length; i++) {
+        const comp = components[i]
+        const netIds = Object.values(getComponentConnections(comp))
+
+        for (let j = 0; j < netIds.length; j++) {
+            const netId = netIds[j]
+            if (netId == null) continue
+
+            if (!netToComponents.has(netId)) {
+                netToComponents.set(netId, [])
+            }
+
+            netToComponents.get(netId).push(comp)
+        }
+    }
+
+    for (const members of netToComponents.values()) {
+        for (let i = 0; i < members.length; i++) {
+            for (let j = i + 1; j < members.length; j++) {
+                adjacency.get(members[i]).add(members[j])
+                adjacency.get(members[j]).add(members[i])
+            }
+        }
+    }
+
+    // Initial signature (round 0) is structural-only: type|bitWidth|portCount.
+    let signatureMap = new Map()
+    for (let i = 0; i < components.length; i++) {
+        const comp = components[i]
+        const connectionCount = Object.keys(getComponentConnections(comp)).length
+        signatureMap.set(
+            comp,
+            fnv1aHash(`${comp.type}|${comp.bitWidth ?? 1}|${connectionCount}`)
+        )
+    }
+
+    // Relabel to compact colour tokens
+    let colours = relabelWlSignatures(signatureMap)
+
+    if (shouldTrace) {
+        console.log(
+            '[canonical][wl] round 0',
+            [...colours.entries()].map(([comp, colour]) => `${comp.type}:${comp.label}:${colour}`)
+        )
+    }
+
+    // Single component -> no neighbours to process
+    if (components.length === 1) {
+        return colours
+    }
+
+    let converged = false
+
+    // Iteratively refine colours. At each round, compute a signature from
+    // (current colour + sorted neighbour colours) and relabel.
+    for (let iteration = 0; iteration < maxIterations; iteration++) {
+        const roundSignatures = new Map()
+
+        for (let i = 0; i < components.length; i++) {
+            const comp = components[i]
+            const neighbourColours = [...(adjacency.get(comp) || new Set())]
+                .map(neighbour => colours.get(neighbour) ?? '')
+                .sort()
+
+            roundSignatures.set(
+                comp,
+                fnv1aHash(`${colours.get(comp)}|${neighbourColours.join('|')}`)
+            )
+        }
+
+        const nextColours = relabelWlSignatures(roundSignatures)
+        let changed = false
+
+        for (const comp of components) {
+            if (nextColours.get(comp) !== colours.get(comp)) {
+                changed = true
+                break
+            }
+        }
+
+        if (shouldTrace) {
+            console.log(
+                `[canonical][wl] round ${iteration + 1}`,
+                [...nextColours.entries()].map(([comp, colour]) => `${comp.type}:${comp.label}:${colour}`)
+            )
+        }
+
+        signatureMap.clear()
+        colours = nextColours
+        roundSignatures.clear()
+
+        if (!changed) {
+            converged = true
+            break
+        }
+    }
+
+    if (!converged && maxIterations > 0 && components.length > 1) {
+        console.warn('[canonical] wlFingerprint reached maxIterations before convergence')
+    }
+
+    return colours
+}
 function extractNets(scope, nodeIndexMap) {
     const { allNodes } = scope
     const uf = new UnionFind(allNodes.length)
@@ -138,24 +322,32 @@ function extractComponents(scope, uf, nodeIndexMap) {
 
 // Sort components by type, then label, then connections for deterministic ID assignment and JSON output.
 function sortComponents(components) {
-    components.sort((a, b) => {
-        if (a.type < b.type) return -1
-        if (a.type > b.type) return 1
+    const fpCounts = new Map()
 
-        if (a.label < b.label) return -1
-        if (a.label > b.label) return 1
+    for (let i = 0; i < components.length; i++) {
+        const comp = components[i]
+        const fp = `${comp.type}\u0000${comp.label}\u0000${getComponentFingerprint(comp)}`
+        comp._fp = fp
+        fpCounts.set(fp, (fpCounts.get(fp) || 0) + 1)
+    }
 
-        const fpA = JSON.stringify(
-            Object.fromEntries(Object.keys(a._connections).sort().map(k => [k, a._connections[k]]))
-        )
-        const fpB = JSON.stringify(
-            Object.fromEntries(Object.keys(b._connections).sort().map(k => [k, b._connections[k]]))
-        )
-        if (fpA < fpB) return -1
-        if (fpA > fpB) return 1
+    const hasTies = [...fpCounts.values()].some(count => count > 1)
 
-        return 0
-    })
+    if (hasTies) {
+        const tiedComponents = components.filter(comp => fpCounts.get(comp._fp) > 1)
+        const wlColours = wlFingerprint(tiedComponents)
+
+        for (let i = 0; i < tiedComponents.length; i++) {
+            const comp = tiedComponents[i]
+            comp._fp = `${comp._fp}|${wlColours.get(comp)}`
+        }
+    }
+
+    components.sort((a, b) => a._fp.localeCompare(b._fp))
+
+    for (let i = 0; i < components.length; i++) {
+        delete components[i]._fp
+    }
 }
 
 function assignComponentIds(components) {
