@@ -27,16 +27,6 @@ class UnionFind {
             this.rank[rootA]++
         }
     }
-
-    getGroups() {
-        const groups = new Map()
-        for (let i = 0; i < this.parent.length; i++) {
-            const root = this.find(i)
-            if (!groups.has(root)) groups.set(root, [])
-            groups.get(root).push(i)
-        }
-        return groups
-    }
 }
 
 function buildNodeIndexMap(allNodes) {
@@ -245,8 +235,7 @@ function extractNets(scope, nodeIndexMap) {
         }
     }
 
-    const groupCount = uf.getGroups().size
-    return { uf, groupCount }
+    return { uf }
 }
 
 function extractComponents(scope, uf, nodeIndexMap) {
@@ -392,22 +381,7 @@ function assignNetIds(components) {
     return { netIdMap, netConnections }
 }
 
-function buildWireLabelMap(allNodes, uf) {
-    const labelByRoot = new Map()
-    for (let i = 0; i < allNodes.length; i++) {
-        const label = allNodes[i].label
-        if (!label) continue
-        const root = uf.find(i)
-        if (!labelByRoot.has(root)) {
-            labelByRoot.set(root, label)
-        }
-    }
-    return labelByRoot
-}
-
-function deriveNetLabel(memberPortRefs, compMap, wireLabel) {
-    if (wireLabel) return wireLabel
-
+function deriveNetLabel(memberPortRefs, compMap) {
     for (let i = 0; i < memberPortRefs.length; i++) {
         const compId = memberPortRefs[i].split('.')[0]
         const comp = compMap.get(compId)
@@ -419,9 +393,8 @@ function deriveNetLabel(memberPortRefs, compMap, wireLabel) {
     return undefined
 }
 
-function buildNetsArray(netIdMap, netConnections, allNodes, components, uf) {
+function buildNetsArray(netIdMap, netConnections, allNodes, components) {
     const compMap = new Map(components.map(c => [c.id, c]))
-    const wireLabelByRoot = buildWireLabelMap(allNodes, uf)
 
     const nets = []
     const entries = Object.entries(netIdMap)
@@ -429,11 +402,7 @@ function buildNetsArray(netIdMap, netConnections, allNodes, components, uf) {
         const groupRoot = Number(entries[i][0])
         const netId = entries[i][1]
 
-        const label = deriveNetLabel(
-            netConnections[netId] || [],
-            compMap,
-            wireLabelByRoot.get(groupRoot)
-        )
+        const label = deriveNetLabel(netConnections[netId] || [], compMap)
 
         const netEntry = {
             id: netId,
@@ -728,7 +697,7 @@ async function canonicaliseSingleScope(scope) {
     assignComponentIds(components)
 
     const { netIdMap, netConnections } = assignNetIds(components)
-    const { nets, renameMap } = buildNetsArray(netIdMap, netConnections, scope.allNodes, components, uf)
+    const { nets, renameMap } = buildNetsArray(netIdMap, netConnections, scope.allNodes, components)
 
     for (let i = 0; i < components.length; i++) {
         const conn = components[i]._connections
