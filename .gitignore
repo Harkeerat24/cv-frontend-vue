@@ -7,6 +7,16 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
+# AI Agent Workflows & State Tracking
+ai.md
+CLAUDE.md
+AGENTS.md
+
+# GitNexus Data, Indexes, and Agent Skill Frameworks
+.gitnexus/
+ladybug.db
+.claude/
+
 node_modules
 dist
 dist-ssr
