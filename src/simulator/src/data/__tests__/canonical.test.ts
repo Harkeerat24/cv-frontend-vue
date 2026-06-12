@@ -2711,4 +2711,140 @@ describe("Large multi-circuit wired project", () => {
 
     expect(base.canonicalHash).not.toBe(changed.canonicalHash);
   });
+
+  describe("SubCircuit specific behavior", () => {
+    it("deduplicates subcircuitRefs to avoid indegree double-counting", async () => {
+      // Scope 'T' is the target scope (id = 101)
+      const T = makeScope("c1", []); // id = 101
+      
+      // Scope 'D' has two SubCircuits referencing target scope T (id = 101)
+      const sub1 = {
+        _type: "SubCircuit",
+        objectType: "SubCircuit",
+        direction: "RIGHT",
+        label: "",
+        bitWidth: 1,
+        propagationDelay: 0,
+        labelDirection: undefined,
+        x: 0,
+        y: 0,
+        _nodes: { inp1: node(0) },
+        _params: [101],
+        _values: {},
+      };
+      const sub2 = {
+        _type: "SubCircuit",
+        objectType: "SubCircuit",
+        direction: "RIGHT",
+        label: "",
+        bitWidth: 1,
+        propagationDelay: 0,
+        labelDirection: undefined,
+        x: 10,
+        y: 10,
+        _nodes: { inp1: node(0) },
+        _params: [101],
+        _values: {},
+      };
+      
+      const D = makeScope("c2", [sub1, sub2]); // id = 102
+      
+      // Canonicalise project containing T and D.
+      // If deduplication is working, the topological order will be computed successfully (T then D).
+      const project = await canonicaliseProject([T, D] as any);
+      expect(project.circuits[101]).toBeDefined();
+      expect(project.circuits[102]).toBeDefined();
+    });
+
+    it("disambiguates SubCircuits referencing different scopes in WL fingerprinting", async () => {
+      const subA = {
+        _type: "SubCircuit",
+        objectType: "SubCircuit",
+        direction: "RIGHT",
+        label: "",
+        bitWidth: 1,
+        propagationDelay: 0,
+        labelDirection: undefined,
+        x: 0,
+        y: 0,
+        _nodes: { inp1: node(0) },
+        _params: [101],
+        _values: {},
+      };
+
+      const subB = {
+        _type: "SubCircuit",
+        objectType: "SubCircuit",
+        direction: "RIGHT",
+        label: "",
+        bitWidth: 1,
+        propagationDelay: 0,
+        labelDirection: undefined,
+        x: 0,
+        y: 0,
+        _nodes: { inp1: node(0) },
+        _params: [102],
+        _values: {},
+      };
+
+      const scopeA = makeScope("s1", [subA]);
+      const scopeB = makeScope("s2", [subB]);
+
+      const resA = await canonicaliseProject(scopeA as any);
+      const resB = await canonicaliseProject(scopeB as any);
+
+      const hashA = resA.circuits[stringToNumber("s1")].canonicalHash;
+      const hashB = resB.circuits[stringToNumber("s2")].canonicalHash;
+
+      expect(hashA).not.toBe(hashB);
+    });
+
+    it("ensures two SubCircuits referencing different scopes in the same circuit get different fingerprints and sort deterministically", async () => {
+      const sub102 = {
+        _type: "SubCircuit",
+        objectType: "SubCircuit",
+        direction: "RIGHT",
+        label: "",
+        bitWidth: 1,
+        propagationDelay: 0,
+        labelDirection: undefined,
+        x: 0,
+        y: 0,
+        _nodes: { inp1: node(0) },
+        _params: [102],
+        _values: {},
+      };
+
+      const sub101 = {
+        _type: "SubCircuit",
+        objectType: "SubCircuit",
+        direction: "RIGHT",
+        label: "",
+        bitWidth: 1,
+        propagationDelay: 0,
+        labelDirection: undefined,
+        x: 0,
+        y: 0,
+        _nodes: { inp1: node(0) },
+        _params: [101],
+        _values: {},
+      };
+
+      const scope = makeScope("cid", [sub102, sub101]);
+      const res = await canonicaliseProject(scope as any);
+      const circuit = res.circuits[stringToNumber("cid")];
+      
+      const comps = circuit.netlist.components;
+      expect(comps.length).toBe(2);
+      expect(comps[0].type).toBe("SubCircuit");
+      expect(comps[1].type).toBe("SubCircuit");
+      
+      // Because of sorting, sub101 (params [101]) should sort before sub102 (params [102])
+      const p0 = (comps[0].properties?.constructorParamaters as unknown[])?.[0];
+      const p1 = (comps[1].properties?.constructorParamaters as unknown[])?.[0];
+      expect(p0).toBe(101);
+      expect(p1).toBe(102);
+    });
+  });
 });
+

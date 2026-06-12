@@ -460,7 +460,12 @@ function wlFingerprint(components: ComponentDraft[]): Map<number, string> {
   const initialSignatures = new Map<number, string>();
   for (let i = 0; i < components.length; i++) {
     const comp = components[i];
-    initialSignatures.set(i, `${comp.type}|${comp.bitWidth ?? 1}|${portKey(comp)}`);
+    let signature = `${comp.type}|${comp.bitWidth ?? 1}|${portKey(comp)}`;
+    if (comp.type === "SubCircuit") {
+      const subId = (comp.properties?.constructorParamaters as unknown[])?.[0] ?? "";
+      signature += `|${subId}`;
+    }
+    initialSignatures.set(i, signature);
   }
 
   let colours = compressColourSignatures(initialSignatures);
@@ -493,7 +498,12 @@ function canonicalSort(components: ComponentDraft[]) {
   const fpMap = new Map<ComponentDraft, string>();
 
   for (const comp of components) {
-    fpMap.set(comp, `${comp.type}|${comp.bitWidth}|${portKey(comp)}`);
+    let signature = `${comp.type}|${comp.bitWidth}|${portKey(comp)}`;
+    if (comp.type === "SubCircuit") {
+      const subId = (comp.properties?.constructorParamaters as unknown[])?.[0] ?? "";
+      signature += `|${subId}`;
+    }
+    fpMap.set(comp, signature);
   }
 
   const wlColours = wlFingerprint(components);
@@ -952,9 +962,14 @@ export async function canonicaliseProject(
     const circuitId = Number(scope.id);
     const circuit = await canonicaliseScope(scope);
 
-    const subcircuitRefs = circuit.netlist.components
-      .filter((c) => c.type === "SubCircuit")
-      .map((c) => Number((c.properties.constructorParamaters as unknown[])?.[0] ?? 0));
+    const subcircuitRefs = [
+      ...new Set(
+        circuit.netlist.components
+          .filter((c) => c.type === "SubCircuit")
+          .map((c) => Number((c.properties.constructorParamaters as unknown[])?.[0]))
+          .filter((id) => !isNaN(id)),
+      ),
+    ];
 
     let indegree = 0;
     for (const targetId of subcircuitRefs) {
@@ -965,7 +980,6 @@ export async function canonicaliseProject(
     }
 
     inDegreeMap.set(circuitId, indegree);
-
     pairs.set(circuitId, circuit);
     circuitHashes.push(circuit.canonicalHash);
   }
