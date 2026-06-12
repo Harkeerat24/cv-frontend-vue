@@ -946,20 +946,11 @@ export async function canonicaliseProject(
 
   for (let i = 0; i < scopes.length; i++) {
     const scope = scopes[i];
-    if (scope && scope.id !== undefined) {
-      const scopeId = Number(scope.id);
-      inDegreeMap.set(scopeId, 0);
-      if (!dependents.has(scopeId)) {
-        dependents.set(scopeId, []);
-      }
-    }
-  }
-
-  for (let i = 0; i < scopes.length; i++) {
-    const scope = scopes[i];
     if (!scope || !scope.allNodes) continue;
 
     const circuitId = Number(scope.id);
+    if (!dependents.has(circuitId)) dependents.set(circuitId, [])
+
     const circuit = await canonicaliseScope(scope);
 
     const subcircuitRefs = [
@@ -971,15 +962,13 @@ export async function canonicaliseProject(
       ),
     ];
 
-    let indegree = 0;
     for (const targetId of subcircuitRefs) {
       if (inDegreeMap.has(targetId)) {
-        indegree++;
         dependents.get(targetId)!.push(circuitId);
       }
     }
 
-    inDegreeMap.set(circuitId, indegree);
+    inDegreeMap.set(circuitId, subcircuitRefs.length);
     pairs.set(circuitId, circuit);
     circuitHashes.push(circuit.canonicalHash);
   }
