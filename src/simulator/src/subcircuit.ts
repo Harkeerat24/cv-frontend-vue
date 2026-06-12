@@ -504,6 +504,32 @@ export default class SubCircuit extends CircuitElement {
   }
 
   /**
+   * Exposes subcircuit port nodes and target scope ID for
+   * canonical serialization. Returning inputNodes / outputNodes
+   * as array-valued port defs lets buildComponentDrafts
+   * generate indexed port keys (e.g. inputNodes_0) so nets
+   * wired to the subcircuit symbol are preserved. The target
+   * scope ID is carried in constructorParamaters so the
+   * dependency graph can be built in canonicaliseProject().
+   * @memberof SubCircuit
+   */
+  /**
+   * @memberof SubCircuit
+   * fn to create save Json Data of object
+   * @return {JSON}
+   */
+  customSave() {
+    return {
+      nodes: {
+        inputNodes: this.inputNodes,
+        outputNodes: this.outputNodes,
+      },
+      values: {},
+      constructorParamaters: [this.id],
+    };
+  }
+
+  /**
    * By design, subcircuit element's input and output nodes are wirelessly
    * connected to the localscope. Therefore no resolve needed.
    */

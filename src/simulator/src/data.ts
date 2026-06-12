@@ -14,6 +14,7 @@ import { bitConverterDialog } from "./utils";
 import { keyBinder } from "#/components/DialogBox/CustomShortcut.vue";
 import { ExportProject } from "#/components/DialogBox/ExportProject.vue";
 import { ImportProject } from "#/components/DialogBox/ImportProject.vue";
+import { ExportCanonical } from "#/components/DialogBox/ExportCanonical.vue";
 
 interface LogixFunction {
   save: typeof save;
@@ -36,6 +37,7 @@ interface LogixFunction {
   customShortcut: typeof keyBinder;
   ExportProject: typeof ExportProject;
   ImportProject: typeof ImportProject;
+  ExportCanonical: typeof ExportCanonical;
 }
 
 const logixFunction: LogixFunction = {
@@ -59,6 +61,7 @@ const logixFunction: LogixFunction = {
   customShortcut: keyBinder,
   ExportProject,
   ImportProject,
+  ExportCanonical,
 };
 
 export default logixFunction;

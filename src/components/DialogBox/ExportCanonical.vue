@@ -57,7 +57,7 @@ export function ExportCanonical() {
 import { ref, watch } from 'vue'
 import { useState } from '../../store/SimulatorStore/state'
 import { useProjectStore } from '../../store/projectStore'
-import { canonicaliseScope } from '../../simulator/src/data/canonical'
+import { canonicaliseProject } from '../../simulator/src/data/canonical'
 import { downloadFile, showMessage } from '../../simulator/src/utils'
 import { scopeList } from '../../simulator/src/circuit'
 import Codemirror from 'codemirror-editor-vue3'
@@ -103,7 +103,7 @@ const getExportScopes = () => {
 const refreshCanonical = async () => {
     isLoading.value = true
     const scopes = getExportScopes()
-    canonicalData.value = await canonicaliseScope(scopes)
+    canonicalData.value = await canonicaliseProject(scopes)
     previewCode.value = JSON.stringify(canonicalData.value, null, 2)
     isLoading.value = false
 }
