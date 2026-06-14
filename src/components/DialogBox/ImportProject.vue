@@ -174,7 +174,8 @@ async function receivedText(fileContent: string, fileName: string) {
 }
 
 function readFile() {
-    const importFile = file.value[0]
+    const importFile = Array.isArray(file.value) ? file.value[0] : (file.value as unknown as File)
+    if (!importFile) return;
     const reader = new FileReader()
     reader.onload = function () {
         receivedText(reader.result as string, importFile.name) // Pass the file content to receivedText
@@ -183,16 +184,19 @@ function readFile() {
 }
 
 function importDataFromFile() {
-    if (file.value.length === 0) {
+    const hasFile = Array.isArray(file.value) ? file.value.length > 0 : !!file.value;
+    if (!hasFile) {
         document.getElementById('fileInput')?.click()
 
         watch(
-            () => file.value[0],
+            () => file.value,
             () => {
-                if (file.value.length !== 0) {
+                const updatedHasFile = Array.isArray(file.value) ? file.value.length > 0 : !!file.value;
+                if (updatedHasFile) {
                     readFile()
                 }
-            }
+            },
+            { deep: true }
         )
     } else {
         readFile()

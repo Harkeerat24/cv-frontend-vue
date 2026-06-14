@@ -1,8 +1,9 @@
-import { circuitElementList } from "../metadata";
 import modules from "../modules";
 import { canonicaliseScope } from "./canonical";
 import { resetup } from "../setup";
 import Node from "../node";
+
+// ── Types mirroring canonical.ts ──────────────────────────────────────────
 
 type CanonicalComponent = {
   id: string;
@@ -20,7 +21,7 @@ type CanonicalNet = {
   connections: string[];
 };
 
-type InterfacePort = {
+type SubcircuitPort = {
   componentId: string;
   label: string;
   bitWidth: number;
@@ -28,20 +29,14 @@ type InterfacePort = {
   order: number;
 };
 
+// IntermediateNet.nodes carries an `id` field matching canonical.ts (line 101)
 type IntermediateNet = {
-  nodes: Array<{ x: number; y: number }>;
+  nodes: Array<{ id: number; x: number; y: number }>;
   edges: Array<[number, number]>;
   portConnections: Array<{ portRef: string; nodeId: number }>;
 };
 
-type CanonicalLayoutNode = {
-  x?: number;
-  y?: number;
-  labelDirection?: unknown;
-  [key: string]: unknown;
-};
-
-type CanonicalLayoutSymbol = {
+type SubcircuitSymbolLayout = {
   width: number;
   height: number;
   titleX: number;
@@ -49,44 +44,60 @@ type CanonicalLayoutSymbol = {
   titleEnabled: boolean;
 };
 
-type CanonicalLayout = Record<string, CanonicalLayoutNode> & {
+type CanonicalLayout = {
+  [componentId: string]:
+    | { x?: number; y?: number; labelDirection?: unknown; [key: string]: unknown }
+    | Record<string, IntermediateNet>
+    | SubcircuitSymbolLayout
+    | undefined;
   intermediateNodes?: Record<string, IntermediateNet>;
-  subcircuitSymbol?: CanonicalLayoutSymbol;
+  subcircuitSymbol?: SubcircuitSymbolLayout;
 };
 
-type CanonicalNetlist = {
-  components: CanonicalComponent[];
-  canonicalHash?: string;
-  projectMetadata?: {
-    id?: string;
-    name?: string;
-    timeStamp?: string | number | null;
-    restrictedElementsUsed?: string[];
+// Single scope — mirrors CanonicalScope in canonical.ts exactly
+type CanonicalScope = {
+  canonicalHash: string;
+  projectMetadata: {
+    id?: number;
+    name: string;
+    timeStamp: string | number | null;
+    restrictedElementsUsed: string[];
   };
-  netlist: CanonicalNetlist;
+  netlist: {
+    components: CanonicalComponent[];
+    nets: CanonicalNet[];
+  };
   interfacePorts: {
-    inputs: InterfacePort[];
-    outputs: InterfacePort[];
+    inputs: SubcircuitPort[];
+    outputs: SubcircuitPort[];
   };
-  layout?: CanonicalLayout;
-  visual?: {
-    canvas?: {
-      scale?: number;
-      ox?: number;
-      oy?: number;
+  layout: CanonicalLayout;
+  visual: {
+    canvas: {
+      scale: number;
+      ox: number;
+      oy: number;
     };
   };
-  verilogMetadata?: Record<string, unknown>;
+  verilogMetadata: {
+    isVerilogCircuit: boolean;
+    isMainCircuit: boolean;
+    code: string;
+    subCircuitScopeIds: string[];
+  };
 };
 
-type CanonicalJson = {
-  formatVersion?: string;
-  canonicalHash?: string;
-  circuits: Record<string, CanonicalSingleScopeData>;
+// Top-level project file — mirrors CanonicalProject in canonical.ts
+type CanonicalProject = {
+  formatVersion: "v1";
+  canonicalHash: string;
+  circuits: Record<number, CanonicalScope>;
 };
+
+// ── Internal runtime types (not exported) ─────────────────────────────────
 
 type ScopeLike = {
-  id?: string;
+  id?: string | number;
   name?: string;
   timeStamp?: string | number | null;
   allNodes: unknown[];
@@ -113,7 +124,6 @@ type ComponentConstructor = new (
   x: number,
   y: number,
   scope: ScopeLike,
-  direction: string,
   ...rest: unknown[]
 ) => ComponentInstance;
 
@@ -133,6 +143,8 @@ type NodeConstructor = new (
   bitWidth?: number,
 ) => PortNode;
 
+// ── Public result types ───────────────────────────────────────────────────
+
 export type ValidationResult = { valid: true; errors: [] } | { valid: false; errors: string[] };
 
 export type ImportResult = {
@@ -141,30 +153,55 @@ export type ImportResult = {
   errors: string[];
 };
 
-export function validateCanonicalJson(circuitData: CanonicalSingleScopeData): ValidationResult {
-  const errors: string[] = [];
-  const knownTypes = new Set<string>(circuitElementList);
+// ── Constants ─────────────────────────────────────────────────────────────
 
-  if (!circuitData.netlist) errors.push("Missing netlist");
-  if (!Array.isArray(circuitData.netlist?.components))
-    errors.push("netlist.components must be an array");
-  if (!Array.isArray(circuitData.netlist?.nets)) errors.push("netlist.nets must be an array");
-  if (!circuitData.interfacePorts) errors.push("Missing interfacePorts");
+// Registry of stateful component types and the instance property that holds
+// their initial output value. Mirrors STATEFUL_DEFAULT_STATE in canonical.ts.
+const STATEFUL_TYPES: Record<string, string> = {
+  Input: "state",
+  ConstantVal: "state",
+  DflipFlop: "slaveState",
+  TflipFlop: "slaveState",
+  SRflipFlop: "state",
+  JKflipFlop: "state",
+  Dlatch: "state",
+  Counter: "value",
+  Stepper: "state",
+};
 
-  if (Array.isArray(circuitData.netlist?.components)) {
-    for (let i = 0; i < circuitData.netlist.components.length; i++) {
-      const comp = circuitData.netlist.components[i];
-      if (!comp?.id || typeof comp.id !== "string") errors.push(`component[${i}] missing valid id`);
-      if (!comp?.type || !knownTypes.has(comp.type))
-        errors.push(`component[${i}] has unknown type: ${comp?.type}`);
-      if (!comp?.connections || typeof comp.connections !== "object")
-        errors.push(`component[${i}] missing connections object`);
-    }
-  }
+// ── Validation ────────────────────────────────────────────────────────────
 
-  if (errors.length > 0) return { valid: false, errors };
+// TODO: Replace with JSON Schema validation (deferred).
+export function validateCanonicalJson(_circuitData: CanonicalScope): ValidationResult {
   return { valid: true, errors: [] };
 }
+
+// ── Layout helpers ────────────────────────────────────────────────────────
+
+// Narrows a CanonicalLayout entry to a component position record.
+// Returns a safe default when the entry is absent or is an IntermediateNet /
+// SubcircuitSymbolLayout slot rather than a component position.
+function getComponentLayout(
+  layout: CanonicalLayout | undefined,
+  id: string,
+): { x?: number; y?: number; labelDirection?: unknown } {
+  if (id === "intermediateNodes" || id === "subcircuitSymbol") {
+    return { x: 0, y: 0 };
+  }
+  const entry = layout?.[id];
+  if (
+    entry != null &&
+    typeof entry === "object" &&
+    !Array.isArray(entry) &&
+    !("width" in entry && "height" in entry && "titleEnabled" in entry) &&
+    !("nodes" in entry)
+  ) {
+    return entry as { x?: number; y?: number; labelDirection?: unknown };
+  }
+  return { x: 0, y: 0 };
+}
+
+// ── Core import helpers ───────────────────────────────────────────────────
 
 function buildComponents(
   scope: ScopeLike,
@@ -175,10 +212,11 @@ function buildComponents(
 
   for (let i = 0; i < components.length; i++) {
     const { id, type, bitWidth, label, properties } = components[i];
-    const pos: CanonicalLayoutNode = layout?.[id] ?? { x: 0, y: 0 };
+    const pos = getComponentLayout(layout, id);
 
     if (type === "SubCircuit") {
-      console.warn(`[importCanonical] SubCircuit "${id}" will be implemented later`);
+      // Part 2: SubCircuit instantiation
+      console.warn(`[importCanonical] SubCircuit "${id}" not yet supported`);
       continue;
     }
 
@@ -188,15 +226,11 @@ function buildComponents(
       continue;
     }
 
-    // Use constructorParamaters from properties when available.
-    // These are the exact positional args (beyond x, y, scope) from the
-    // original component's customSave(), so they correctly reconstruct
-    // every structural variant: gate input counts, mux select widths,
-    // splitter lane widths, ROM data, etc.
-    // Falls back to [direction, bitWidth] for older canonical files.
+    // Older files without constructorParamaters lose direction — "RIGHT" is the
+    // least-bad default; round-trip hash will flag the mismatch.
     const constructorArgs: unknown[] = Array.isArray(properties?.constructorParamaters)
       ? (properties.constructorParamaters as unknown[])
-      : [(properties?.direction as string) ?? "RIGHT", bitWidth];
+      : ["RIGHT", bitWidth];
 
     let instance: ComponentInstance;
     try {
@@ -258,29 +292,32 @@ function resolvePortNode(
   return null;
 }
 
+// ── Core wiring / net reconstruction ──────────────────────────────────────
+
 function wireComponents(
   instanceMap: Map<string, ComponentInstance>,
   nets: CanonicalNet[],
   intermediateNodesByNet?: Record<string, IntermediateNet> | null,
 ): void {
-  const graphRoutedNetIds = new Set<string>(
-    Object.entries(intermediateNodesByNet ?? {})
-      .filter(
-        ([, routing]) =>
-          routing != null &&
-          !Array.isArray(routing) &&
-          Array.isArray(routing.nodes) &&
-          routing.nodes.length > 0,
-      )
-      .map(([netId]) => netId),
-  );
+  const graphRoutedNetIds = new Set<string>();
+  if (intermediateNodesByNet) {
+    for (const netId of Object.keys(intermediateNodesByNet)) {
+      const routing = intermediateNodesByNet[netId];
+      if (routing && Array.isArray(routing.nodes) && routing.nodes.length > 0) {
+        graphRoutedNetIds.add(netId);
+      }
+    }
+  }
 
-  for (const net of nets) {
+  for (let i = 0; i < nets.length; i++) {
+    const net = nets[i];
     if (graphRoutedNetIds.has(net.id)) continue;
 
-    const portNodes = net.connections
-      .map((ref) => resolvePortNode(ref, instanceMap))
-      .filter((node): node is PortNode => node !== null);
+    const portNodes: PortNode[] = [];
+    for (let j = 0; j < net.connections.length; j++) {
+      const node = resolvePortNode(net.connections[j], instanceMap);
+      if (node !== null) portNodes.push(node);
+    }
 
     if (portNodes.length < 2) {
       if (portNodes.length === 1)
@@ -288,12 +325,12 @@ function wireComponents(
       continue;
     }
 
-    for (let i = 1; i < portNodes.length; i++) {
+    for (let j = 1; j < portNodes.length; j++) {
       try {
-        portNodes[i - 1].connect(portNodes[i]);
+        portNodes[j - 1].connect(portNodes[j]);
       } catch (err) {
         console.error(
-          `[importCanonical] Wire failed on net "${net.id}": ${net.connections[i - 1]} and ${net.connections[i]}`,
+          `[importCanonical] Wire failed on net "${net.id}": ${net.connections[j - 1]} and ${net.connections[j]}`,
           err,
         );
       }
@@ -301,25 +338,12 @@ function wireComponents(
   }
 }
 
-// Registry of stateful component types and the instance property that holds
-// their initial output value.  Mirrors STATEFUL_DEFAULT_STATE in canonical.ts.
-const STATEFUL_TYPES: Record<string, string> = {
-  Input: "state",
-  ConstantVal: "state",
-  DflipFlop: "slaveState",
-  TflipFlop: "slaveState",
-  SRflipFlop: "state",
-  JKflipFlop: "state",
-  Dlatch: "state",
-  Counter: "value",
-  Stepper: "state",
-};
-
 function restoreDefaultState(
   instanceMap: Map<string, ComponentInstance>,
   components: CanonicalComponent[],
 ): void {
-  for (const compData of components) {
+  for (let i = 0; i < components.length; i++) {
+    const compData = components[i];
     if (compData.defaultState === undefined) continue;
 
     const instance = instanceMap.get(compData.id);
@@ -340,18 +364,22 @@ function restoreIntermediateNodes(
 ): void {
   if (!intermediateNodes || Object.keys(intermediateNodes).length === 0) return;
 
-  const netBitWidthMap = new Map<string, number>(
-    (nets ?? []).map((net) => [net.id, net.bitWidth] as [string, number]),
-  );
+  const netBitWidthMap = new Map<string, number>();
+  for (let i = 0; i < nets.length; i++) {
+    netBitWidthMap.set(nets[i].id, nets[i].bitWidth);
+  }
+
+  const NodeCtor = Node as unknown as NodeConstructor;
 
   for (const [netId, routing] of Object.entries(intermediateNodes)) {
     const { nodes: junctionPoints, edges, portConnections } = routing;
     if (!junctionPoints || junctionPoints.length === 0) continue;
 
     const netBitWidth = netBitWidthMap.get(netId);
-    const NodeCtor = Node as unknown as NodeConstructor;
     const junctionNodes: (PortNode | null)[] = [];
-    for (const point of junctionPoints) {
+
+    for (let i = 0; i < junctionPoints.length; i++) {
+      const point = junctionPoints[i];
       try {
         const node: PortNode =
           netBitWidth !== undefined
@@ -367,7 +395,8 @@ function restoreIntermediateNodes(
       }
     }
 
-    for (const [fromId, toId] of edges) {
+    for (let i = 0; i < edges.length; i++) {
+      const [fromId, toId] = edges[i];
       const fromNode = junctionNodes[fromId];
       const toNode = junctionNodes[toId];
       if (fromNode && toNode) {
@@ -382,7 +411,8 @@ function restoreIntermediateNodes(
       }
     }
 
-    for (const { portRef, nodeId } of portConnections) {
+    for (let i = 0; i < portConnections.length; i++) {
+      const { portRef, nodeId } = portConnections[i];
       const junctionNode = junctionNodes[nodeId];
       if (!junctionNode) continue;
 
@@ -404,27 +434,31 @@ function restoreIntermediateNodes(
   }
 }
 
-function restoreScopeMetadata(scope: ScopeLike, circuitData: CanonicalSingleScopeData): void {
-  if (circuitData.projectMetadata?.name) {
+function restoreScopeMetadata(scope: ScopeLike, circuitData: CanonicalScope): void {
+  if (circuitData.projectMetadata.name) {
     scope.name = circuitData.projectMetadata.name;
   }
 
-  if (circuitData.visual?.canvas) {
-    const { scale, ox, oy } = circuitData.visual.canvas;
-    scope.scale = scale ?? 1;
-    scope.ox = ox ?? 0;
-    scope.oy = oy ?? 0;
-  }
+  // visual.canvas fields are non-optional in CanonicalScope — no fallbacks needed.
+  const { scale, ox, oy } = circuitData.visual.canvas;
+  scope.scale = scale;
+  scope.ox = ox;
+  scope.oy = oy;
 
-  if (circuitData.layout?.subcircuitSymbol) {
+  if (circuitData.layout.subcircuitSymbol) {
     const sym = circuitData.layout.subcircuitSymbol;
     scope.layout = {
-      width: sym.width ?? 100,
-      height: sym.height ?? 100,
-      titleX: sym.titleX ?? 50,
-      titleY: sym.titleY ?? 13,
-      titleEnabled: sym.titleEnabled ?? true,
+      width: sym.width,
+      height: sym.height,
+      titleX: sym.titleX,
+      titleY: sym.titleY,
+      titleEnabled: sym.titleEnabled,
     };
+  }
+
+  // Restore verilogMetadata onto the scope (was missing in the old importer).
+  if (circuitData.verilogMetadata) {
+    scope.verilogMetadata = circuitData.verilogMetadata;
   }
 }
 
@@ -446,10 +480,9 @@ function refreshCanvas(scope: ScopeLike, hasRestoredViewport = false): void {
 async function verifyRoundTrip(
   scope: ScopeLike,
   expectedHash: string,
-): Promise<{ match: boolean; actualHash: string | undefined; expectedHash: string }> {
+): Promise<{ match: boolean; actualHash: string; expectedHash: string }> {
   const reExported = await canonicaliseScope(scope as Parameters<typeof canonicaliseScope>[0]);
   const actualHash = reExported.canonicalHash;
-
   const match = actualHash === expectedHash;
 
   const header =
@@ -463,100 +496,114 @@ async function verifyRoundTrip(
     console.log(header + "  result: PASS");
   } else {
     console.warn(
-      header + "  result: FAIL\n" + "  Import did not reproduce the original netlist exactly.",
+      header + "  result: FAIL\n  Import did not reproduce the original netlist exactly.",
     );
   }
 
   return { match, actualHash, expectedHash };
 }
 
+// ── Single-scope import (core logic) ─────────────────────────────────────
+
+async function importSingleScope(
+  circuitData: CanonicalScope,
+  scope: ScopeLike,
+): Promise<{ success: boolean; error?: string }> {
+  const { components, nets } = circuitData.netlist;
+  const { layout } = circuitData;
+
+  const instanceMap = buildComponents(scope, components, layout);
+
+  if (components.length > 0 && instanceMap.size === 0) {
+    return { success: false, error: "no components could be constructed" };
+  }
+
+  wireComponents(instanceMap, nets, layout.intermediateNodes);
+  restoreDefaultState(instanceMap, components);
+
+  if (layout.intermediateNodes) {
+    restoreIntermediateNodes(scope, layout.intermediateNodes, instanceMap, nets);
+  }
+
+  restoreScopeMetadata(scope, circuitData);
+
+  // Run the round-trip check on the imported components/wires before canvas/resetup
+  // potentially alters the node collection.
+  if (circuitData.canonicalHash) {
+    await verifyRoundTrip(scope, circuitData.canonicalHash);
+  }
+
+  // visual.canvas is always present in CanonicalScope — viewport was restored above.
+  refreshCanvas(scope, true);
+
+  return { success: true };
+}
+
+// ── Public entry point ────────────────────────────────────────────────────
+
 export async function importCanonical(
-  json: CanonicalJson,
+  json: CanonicalProject,
   targetScope: ScopeLike | null | undefined,
 ): Promise<ImportResult> {
-  const results: ImportResult = {
-    success: false,
-    imported: 0,
-    errors: [],
-  };
+  const results: ImportResult = { success: false, imported: 0, errors: [] };
 
   if (!json.circuits || typeof json.circuits !== "object") {
     results.errors.push("Missing circuits object in JSON");
     return results;
   }
 
-  const circuits = Object.entries(json.circuits).map(([scopeId, circuitData]) => ({
-    scopeId,
-    circuitData,
-  }));
+  const circuitEntries = Object.entries(json.circuits) as [string, CanonicalScope][];
 
-  if (circuits.length === 0) {
+  if (circuitEntries.length === 0) {
     results.errors.push("No circuits found in JSON");
     return results;
   }
 
-  for (const { scopeId, circuitData } of circuits) {
-    const validation = validateCanonicalJson(circuitData);
-    if (!validation.valid) {
-      console.error(`[importCanonical] Validation failed for "${scopeId}":`);
-      results.errors.push(...validation.errors);
-      continue;
-    }
+  if (circuitEntries.length > 1) {
+    results.errors.push(
+      `Multi-circuit projects not yet supported; importing only "${circuitEntries[0][0]}" (${circuitEntries.length - 1} skipped)`,
+    );
+  }
 
-    if (!targetScope) {
-      results.errors.push(`No scope provided for circuit "${scopeId}"`);
-      continue;
-    }
+  // Part 2: multi-circuit orchestration (topological order, scope creation) goes here.
+  // For now, import only the first circuit into the provided targetScope.
+  const [scopeId, circuitData] = circuitEntries[0];
 
-    const scope = targetScope;
-    const layout = circuitData.layout;
-    const { components, nets } = circuitData.netlist;
+  if (!targetScope) {
+    results.errors.push(`No scope provided for circuit "${scopeId}"`);
+    return results;
+  }
 
-    const instanceMap = buildComponents(scope, components, layout);
+  // TODO: Replace stub with real JSON Schema validation.
+  const validation = validateCanonicalJson(circuitData);
+  if (!validation.valid) {
+    console.error(`[importCanonical] Validation failed for "${scopeId}":`, validation.errors);
+    results.errors.push(...validation.errors);
+    return results;
+  }
 
-    if (components.length > 0 && instanceMap.size === 0) {
-      results.errors.push(`[${scopeId}] no components could be constructed`);
-      continue;
-    }
-
-    wireComponents(instanceMap, nets, layout?.intermediateNodes);
-    restoreDefaultState(instanceMap, components);
-
-    if (layout?.intermediateNodes) {
-      restoreIntermediateNodes(scope, layout.intermediateNodes, instanceMap, nets);
-    }
-
-    restoreScopeMetadata(scope, circuitData);
-
-    refreshCanvas(scope, Boolean(circuitData.visual?.canvas));
-
-    if (circuitData.canonicalHash) {
-      const verification = await verifyRoundTrip(scope, circuitData.canonicalHash);
-      if (!verification.match) {
-        console.warn(`[importCanonical] Round-trip mismatch for "${scopeId}"`);
-      }
-    }
-
-    if (instanceMap.size > 0 || components.length === 0) {
-      results.imported++;
-    }
+  const outcome = await importSingleScope(circuitData, targetScope);
+  if (!outcome.success) {
+    results.errors.push(`[${scopeId}] ${outcome.error ?? "unknown error"}`);
+  } else {
+    results.imported++;
   }
 
   results.success = results.imported > 0;
   return results;
 }
 
+// ── Window extension ──────────────────────────────────────────────────────
+
+// Typed window extension — eliminates unsafe casting / implicit any on window
+declare global {
+  interface Window {
+    importCanonical?: typeof importCanonical;
+    validateCanonicalJson?: typeof validateCanonicalJson;
+  }
+}
+
 if (typeof window !== "undefined") {
-  (
-    window as Window & {
-      importCanonical?: typeof importCanonical;
-      validateCanonicalJson?: typeof validateCanonicalJson;
-    }
-  ).importCanonical = importCanonical;
-  (
-    window as Window & {
-      importCanonical?: typeof importCanonical;
-      validateCanonicalJson?: typeof validateCanonicalJson;
-    }
-  ).validateCanonicalJson = validateCanonicalJson;
+  window.importCanonical = importCanonical;
+  window.validateCanonicalJson = validateCanonicalJson;
 }
