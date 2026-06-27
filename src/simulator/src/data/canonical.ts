@@ -73,7 +73,7 @@ type ComponentDraft = {
   [key: string]: unknown;
 };
 
-type CanonicalComponent = {
+export type CanonicalComponent = {
   id: string;
   type: string;
   label: string;
@@ -83,13 +83,13 @@ type CanonicalComponent = {
   defaultState?: unknown;
 };
 
-type CanonicalNet = {
+export type CanonicalNet = {
   id: string;
   bitWidth: number;
   connections: string[];
 };
 
-type SubcircuitPort = {
+export type SubcircuitPort = {
   componentId: string;
   label: string;
   bitWidth: number;
@@ -97,13 +97,13 @@ type SubcircuitPort = {
   order: number;
 };
 
-type IntermediateNet = {
+export type IntermediateNet = {
   nodes: Array<{ id: number; x: number; y: number }>;
   edges: Array<[number, number]>;
   portConnections: Array<{ portRef: string; nodeId: number }>;
 };
 
-type SubcircuitSymbolLayout = {
+export type SubcircuitSymbolLayout = {
   width: number;
   height: number;
   titleX: number;
@@ -111,15 +111,21 @@ type SubcircuitSymbolLayout = {
   titleEnabled: boolean;
 };
 
-type CanonicalProject = {
+export type CanonicalProject = {
   formatVersion: "v1";
   canonicalHash: string;
   circuits: Record<number, CanonicalScope>;
 };
 
-type CanonicalLayout = {
+export type CanonicalLayout = {
   [componentId: string]:
-    | { x?: number; y?: number; labelDirection?: unknown; [key: string]: unknown }
+    | {
+        x?: number;
+        y?: number;
+        labelDirection?: unknown;
+        layoutProperties?: unknown;
+        [key: string]: unknown;
+      }
     | Record<string, IntermediateNet>
     | SubcircuitSymbolLayout
     | undefined;
@@ -127,7 +133,7 @@ type CanonicalLayout = {
   subcircuitSymbol?: SubcircuitSymbolLayout;
 };
 
-type CanonicalScope = {
+export type CanonicalScope = {
   canonicalHash: string;
   projectMetadata: {
     id?: number;
@@ -197,6 +203,40 @@ export class UnionFind {
   }
 }
 
+// ─── Commutative Port Groups ─────────────────────────────────────────────────
+// Ports within each group are functionally interchangeable.  Swapping the
+// physical wires between ports in the same group produces a logically
+// equivalent circuit, so the canonical representation must normalise the
+// port→net assignment so that lower port indices always reference nets with
+// lower canonical IDs.
+//
+// Single-string groups (e.g. `["inp"]`) denote an array port where all array
+// elements are symmetric.  Multi-string groups (e.g. `["inpA", "inpB"]`) list
+// scalar ports that are symmetric with each other.
+//
+// Multiplexer/Demultiplexer are deliberately absent: their data inputs/outputs
+// are selected by a control signal, so position is semantically meaningful
+// (inp_0 is the value when select=0, inp_1 when select=1, etc.).
+//
+// DEPENDENCY: Normalisation sorts symmetric ports by their net ID, which is
+// assigned in canonical component order (determined by wlFingerprint +
+// canonicalSort).  If canonicalSort ever ties two components in different ways
+// across logically-equivalent circuits, this sorting would diverge and the
+// hash would too.  Currently wlFingerprint converges to a unique colouring
+// for non-isomorphic graphs, so this is safe.
+
+const COMMUTATIVE_PORT_GROUPS: Record<string, string[][]> = {
+  AndGate: [["inp"]],
+  OrGate: [["inp"]],
+  NandGate: [["inp"]],
+  NorGate: [["inp"]],
+  XorGate: [["inp"]],
+  XnorGate: [["inp"]],
+  Adder: [["inpA", "inpB"]],
+  verilogMultiplier: [["inpA", "inpB"]],
+};
+// ─────────────────────────────────────────────────────────────────────────────
+
 const STRUCTURAL_STATE: Set<string> = new Set(["ConstantVal"]);
 
 const DIRECTION_BEARING: Set<string> = new Set([
@@ -249,7 +289,7 @@ const DIRECTION_BEARING: Set<string> = new Set([
   "TB_Output",
 ]);
 
-const STATEFUL_DEFAULT_STATE: Record<string, string> = {
+export const STATEFUL_DEFAULT_STATE: Record<string, string> = {
   Input: "state",
   ConstantVal: "state",
   DflipFlop: "slaveState",
@@ -328,7 +368,21 @@ function buildComponentDrafts(scope: CVScope, uf: UnionFind, nodeIndexMap: NodeI
       }
 
       if (saveData.constructorParamaters !== undefined) {
-        properties.constructorParamaters = saveData.constructorParamaters;
+        properties.constructorParamaters = normalizeConstructorParamaters(
+          typeName,
+          saveData.constructorParamaters,
+        );
+      }
+
+      // Capture layoutProperties for Input/Output before normalize strips it,
+      // so buildLayout doesn't need a second call to customSave().
+      let layoutProperties: unknown;
+      if (
+        (typeName === "Input" || typeName === "Output") &&
+        Array.isArray(saveData.constructorParamaters) &&
+        saveData.constructorParamaters.length > 2
+      ) {
+        layoutProperties = sortRecordDeep(saveData.constructorParamaters[2]);
       }
 
       const statePropKey = STATEFUL_DEFAULT_STATE[typeName];
@@ -356,6 +410,7 @@ function buildComponentDrafts(scope: CVScope, uf: UnionFind, nodeIndexMap: NodeI
         _y: comp.y,
         _instance: comp,
         _portDefs: saveData.nodes,
+        ...(layoutProperties !== undefined ? { _layoutProperties: layoutProperties } : {}),
       });
     }
   }
@@ -410,6 +465,30 @@ function compressColourSignatures(signatures: Map<number, string>): Map<number, 
   }
 
   return colours;
+}
+
+function sortRecordDeep(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(sortRecordDeep);
+  }
+
+  if (value !== null && typeof value === "object") {
+    const sorted: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort(naturalCompare)) {
+      sorted[key] = sortRecordDeep((value as Record<string, unknown>)[key]);
+    }
+    return sorted;
+  }
+
+  return value;
+}
+
+function normalizeConstructorParamaters(type: string, params: unknown[]) {
+  const normalized = params.slice();
+  if ((type === "Input" || type === "Output") && normalized.length > 2) {
+    normalized.splice(2, 1);
+  }
+  return normalized;
 }
 
 function sameColours(a: Map<number, string>, b: Map<number, string>): boolean {
@@ -730,6 +809,13 @@ function buildLayout(
       y: comp._y,
       labelDirection: comp._labelDirection,
     };
+
+    if (
+      (comp.type === "Input" || comp.type === "Output") &&
+      comp._layoutProperties !== undefined
+    ) {
+      (layout[comp.id] as Record<string, unknown>).layoutProperties = comp._layoutProperties;
+    }
   }
 
   if (scope.layout && typeof scope.layout === "object") {
@@ -779,13 +865,114 @@ function buildSubcircuitPorts(components: ComponentDraft[]) {
   return { inputs, outputs };
 }
 
+/**
+ * Normalise commutative-port → net assignments so the canonical
+ * representation is independent of which physical wire connects to which
+ * symmetric pin.  For a two-input AND gate, swapping inp_0 ↔ inp_1 produces
+ * a logically equivalent circuit — the canonical output must reflect that.
+ *
+ * Mutates components and nets in-place, rewriting port refs in both so they
+ * stay consistent.
+ */
+function normalizeCommutativePorts(
+  canonicalComponents: CanonicalComponent[],
+  nets: CanonicalNet[],
+): Map<string, string> {
+  // Build net → index lookup for deterministic sorting.
+  const netIndex = new Map<string, number>();
+  for (let i = 0; i < nets.length; i++) {
+    netIndex.set(nets[i].id, i);
+  }
+
+  // Collect old → new port-reference renames.
+  const portRename = new Map<string, string>();
+
+  for (const comp of canonicalComponents) {
+    const groups = COMMUTATIVE_PORT_GROUPS[comp.type];
+    if (!groups) continue;
+
+    groupLoop: for (const group of groups) {
+      const isSingleBase = group.length === 1;
+
+      // Gather every port that belongs to this group.
+      const entries: { portName: string; netId: string }[] = [];
+      for (const portName of Object.keys(comp.connections)) {
+        const inGroup = isSingleBase
+          ? portName === group[0] || portName.startsWith(group[0] + "_")
+          : group.includes(portName);
+        if (inGroup) {
+          entries.push({ portName, netId: comp.connections[portName] });
+          delete comp.connections[portName];
+        }
+      }
+
+      if (entries.length <= 1) {
+        // Put back unchanged.
+        for (const e of entries) comp.connections[e.portName] = e.netId;
+        continue groupLoop;
+      }
+
+      // Sort entries so lower port indices receive nets with lower indices.
+      entries.sort((a, b) => {
+        const ai = netIndex.get(a.netId) ?? Infinity;
+        const bi = netIndex.get(b.netId) ?? Infinity;
+        return ai - bi;
+      });
+
+      // Reassign to canonical port names.
+      // Array-port groups (isSingleBase) always use `base_N` naming
+      // to match what buildComponentDrafts generates (inp_0, inp_1…),
+      // avoiding bare name like "inp" that would break import resolution:
+      //   resolvePortNode("comp.inp_0") → instance["inp"][0] ✓
+      //   resolvePortNode("comp.inp")   → instance["inp"] = array ❌
+      for (let i = 0; i < entries.length; i++) {
+        const canonicalName = isSingleBase
+          ? `${group[0]}_${i}`
+          : group[i];
+
+        // Guard against named-group overflow (should never happen, but
+        // protect against future types with more entries than declared).
+        if (canonicalName === undefined) {
+          console.warn(
+            `[canonical] normalizeCommutativePorts: ` +
+              `${comp.type} has ${entries.length} commutative ports ` +
+              `but only ${group.length} names declared; keeping original.`,
+          );
+          comp.connections[entries[i].portName] = entries[i].netId;
+          continue;
+        }
+
+        comp.connections[canonicalName] = entries[i].netId;
+
+        const oldRef = `${comp.id}.${entries[i].portName}`;
+        const newRef = `${comp.id}.${canonicalName}`;
+        if (oldRef !== newRef) {
+          portRename.set(oldRef, newRef);
+        }
+      }
+    }
+  }
+
+  // Apply rename map to every net's member list.
+  for (const net of nets) {
+    for (let i = 0; i < net.connections.length; i++) {
+      const renamed = portRename.get(net.connections[i]);
+      if (renamed) net.connections[i] = renamed;
+    }
+    net.connections.sort(naturalCompare);
+  }
+
+  return portRename;
+}
+
 function buildCanonicalComponents(
   components: ComponentDraft[],
   composedNetMap: Map<number, string>,
 ) {
   return components.map((component) => {
     const connections: Record<string, string> = {};
-    for (const [port, root] of Object.entries(component._connections)) {
+    for (const port of Object.keys(component._connections).sort(naturalCompare)) {
+      const root = component._connections[port];
       const netId = composedNetMap.get(root);
       if (netId !== undefined) {
         connections[port] = netId;
@@ -798,7 +985,7 @@ function buildCanonicalComponents(
       label: component.label,
       bitWidth: component.bitWidth,
       connections,
-      properties: component.properties,
+      properties: sortRecordDeep(component.properties) as Record<string, unknown>,
     };
 
     if (component._state !== undefined) {
@@ -844,6 +1031,21 @@ export async function canonicaliseScope(scope: CVScope): Promise<CanonicalScope>
   const visual = buildVisual(scope);
   const canonicalComponents = buildCanonicalComponents(components, composedNetMap);
 
+  // Normalise commutative gate input assignments so logically equivalent
+  // wiring produces the same canonical output and hash.  Operates on
+  // canonicalComponents and nets in-place.  Returns a rename map we also
+  // apply to intermediate-node portConnections so the layout stays consistent.
+  const portRename = normalizeCommutativePorts(canonicalComponents, nets);
+  if (portRename.size > 0 && layout.intermediateNodes) {
+    for (const routing of Object.values(layout.intermediateNodes)) {
+      for (const pc of routing.portConnections) {
+        const renamed = portRename.get(pc.portRef);
+        if (renamed) pc.portRef = renamed;
+      }
+      routing.portConnections.sort((a, b) => naturalCompare(a.portRef, b.portRef));
+    }
+  }
+
   const netlist = { components: canonicalComponents, nets };
 
   const netlistForHash = {
@@ -858,10 +1060,6 @@ export async function canonicaliseScope(scope: CVScope): Promise<CanonicalScope>
         if (params.length > 0) {
           params[0] = null;
         }
-        // Null layoutProperties (index 2) for Input and Output components to avoid layout positioning/ID differences breaking determinism.
-        if ((c.type === "Input" || c.type === "Output") && params.length > 2) {
-          params[2] = null;
-        }
         comp = { ...comp, properties: { ...comp.properties, constructorParamaters: params } };
       }
       return comp;
@@ -873,7 +1071,9 @@ export async function canonicaliseScope(scope: CVScope): Promise<CanonicalScope>
     outputs: interfacePorts.outputs.map((p) => ({ ...p, label: "" })),
   };
   const canonicalHash = await sha256(
-    JSON.stringify({ netlist: netlistForHash, interfacePorts: interfacePortsForHash }),
+    JSON.stringify(
+      sortRecordDeep({ netlist: netlistForHash, interfacePorts: interfacePortsForHash }),
+    ),
   );
 
   console.log(`[canonical] Canonical hash for scope "${scope.name}": ${canonicalHash}`);
@@ -943,13 +1143,14 @@ export async function canonicaliseProject(
   const circuitHashes: string[] = [];
   const inDegreeMap = new Map<number, number>();
   const dependents = new Map<number, number[]>();
+  const scopeIds = new Set(scopes.map((scope) => Number(scope?.id)).filter((id) => !isNaN(id)));
 
   for (let i = 0; i < scopes.length; i++) {
     const scope = scopes[i];
     if (!scope || !scope.allNodes) continue;
 
     const circuitId = Number(scope.id);
-    if (!dependents.has(circuitId)) dependents.set(circuitId, [])
+    if (!dependents.has(circuitId)) dependents.set(circuitId, []);
 
     const circuit = await canonicaliseScope(scope);
 
@@ -958,14 +1159,13 @@ export async function canonicaliseProject(
         circuit.netlist.components
           .filter((c) => c.type === "SubCircuit")
           .map((c) => Number((c.properties.constructorParamaters as unknown[])?.[0]))
-          .filter((id) => !isNaN(id)),
+          .filter((id) => !isNaN(id) && scopeIds.has(id) && id !== circuitId),
       ),
     ];
 
     for (const targetId of subcircuitRefs) {
-      if (inDegreeMap.has(targetId)) {
-        dependents.get(targetId)!.push(circuitId);
-      }
+      if (!dependents.has(targetId)) dependents.set(targetId, []);
+      dependents.get(targetId)!.push(circuitId);
     }
 
     inDegreeMap.set(circuitId, subcircuitRefs.length);
