@@ -334,8 +334,18 @@ function buildComponentDrafts(scope: CVScope, uf: UnionFind, nodeIndexMap: NodeI
     const instances = scope[typeName] as CVComponent[] | undefined;
     if (!instances || instances.length === 0) continue;
 
-    for (let j = 0; j < instances.length; j++) {
-      const comp = instances[j];
+    // Sort instances within each type by (x, y) so structurally identical
+    // components (same type, same bitWidth, same WL fingerprint) still get
+    // a deterministic initial order independent of how the scope was loaded
+    // (project data vs canonical import).  Position is stored in the
+    // canonical layout and is stable across the round trip.
+    const sorted = [...instances].sort((a, b) => {
+      const xCmp = naturalCompare(String(a.x ?? 0), String(b.x ?? 0));
+      return xCmp !== 0 ? xCmp : naturalCompare(String(a.y ?? 0), String(b.y ?? 0));
+    });
+
+    for (let j = 0; j < sorted.length; j++) {
+      const comp = sorted[j];
       const saveData = comp.customSave();
       const portDefs = saveData.nodes;
 
@@ -533,7 +543,10 @@ function buildWLAdjacency(components: ComponentDraft[]) {
   return result;
 }
 
-function wlFingerprint(components: ComponentDraft[]): Map<number, string> {
+function wlFingerprint(
+  components: ComponentDraft[],
+  childHashes?: Map<number, string>,
+): Map<number, string> {
   if (components.length === 0) return new Map<number, string>();
 
   const initialSignatures = new Map<number, string>();
@@ -541,8 +554,9 @@ function wlFingerprint(components: ComponentDraft[]): Map<number, string> {
     const comp = components[i];
     let signature = `${comp.type}|${comp.bitWidth ?? 1}|${portKey(comp)}`;
     if (comp.type === "SubCircuit") {
-      const subId = (comp.properties?.constructorParamaters as unknown[])?.[0] ?? "";
-      signature += `|${subId}`;
+      const id = (comp.properties?.constructorParamaters as unknown[])?.[0];
+      const childId = id !== undefined ? Number(id) : NaN;
+      signature += `|${(!isNaN(childId) && childHashes?.get(childId)) ?? String(id ?? "")}`;
     }
     initialSignatures.set(i, signature);
   }
@@ -573,19 +587,20 @@ function wlFingerprint(components: ComponentDraft[]): Map<number, string> {
   return colours;
 }
 
-function canonicalSort(components: ComponentDraft[]) {
+function canonicalSort(components: ComponentDraft[], childHashes?: Map<number, string>) {
   const fpMap = new Map<ComponentDraft, string>();
 
   for (const comp of components) {
     let signature = `${comp.type}|${comp.bitWidth}|${portKey(comp)}`;
     if (comp.type === "SubCircuit") {
-      const subId = (comp.properties?.constructorParamaters as unknown[])?.[0] ?? "";
-      signature += `|${subId}`;
+      const id = (comp.properties?.constructorParamaters as unknown[])?.[0];
+      const childId = id !== undefined ? Number(id) : NaN;
+      signature += `|${(!isNaN(childId) && childHashes?.get(childId)) ?? String(id ?? "")}`;
     }
     fpMap.set(comp, signature);
   }
 
-  const wlColours = wlFingerprint(components);
+  const wlColours = wlFingerprint(components, childHashes);
   for (let i = 0; i < components.length; i++) {
     const comp = components[i];
     fpMap.set(comp, `${fpMap.get(comp)}|${wlColours.get(i) ?? ""}`);
@@ -641,7 +656,7 @@ function buildCanonicalNets(
 
     const netEntry: CanonicalNet = {
       id: netId,
-      bitWidth: allNodes[groupRoot]?.bitWidth ?? 0,
+      bitWidth: Number(allNodes[groupRoot]?.bitWidth) || 0,
       connections: members,
     };
 
@@ -871,98 +886,230 @@ function buildSubcircuitPorts(components: ComponentDraft[]) {
  * symmetric pin.  For a two-input AND gate, swapping inp_0 ↔ inp_1 produces
  * a logically equivalent circuit — the canonical output must reflect that.
  *
- * Mutates components and nets in-place, rewriting port refs in both so they
- * stay consistent.
+ * Algorithm (two-phase):
+ *  1. For each commutative component, sort its symmetric ports by the
+ *     "external signature" of the net they connect to — the sorted list of
+ *     OTHER component port-refs on that net (excluding the component itself).
+ *     Because component IDs are fixed before normalization, these signatures
+ *     are stable even when another commutative component's port names change.
+ *     Ports are then reassigned in canonical order so that lower-numbered
+ *     ports connect to nets with lower (lexicographic) external signatures.
+ *
+ *  2. After all port renames are applied to net member lists, sort the nets
+ *     themselves by their full sorted member list and renumber them
+ *     (net_0, net_1, …).  All component port→net references are updated
+ *     to use the new net IDs.
+ *
+ * Phase 2 is essential: without it, two logically equivalent circuits that
+ * differ only in which commutative port connects to which net would have
+ * nets with identical member lists but different IDs because the first-
+ * to-claim order from assignNetIds depends on component sorting order.
+ *
+ * Mutates canonicalComponents and nets in-place.
+ *
+ * @returns { portRename, netRename } — maps from old port-ref / old net-id
+ *          to their new canonical names, so the caller can update layout
+ *          intermediate-node structures consistently.
  */
 function normalizeCommutativePorts(
   canonicalComponents: CanonicalComponent[],
   nets: CanonicalNet[],
-): Map<string, string> {
-  // Build net → index lookup for deterministic sorting.
-  const netIndex = new Map<string, number>();
-  for (let i = 0; i < nets.length; i++) {
-    netIndex.set(nets[i].id, i);
+): { portRename: Map<string, string>; netRename: Map<string, string> } {
+  const netMap = new Map<string, CanonicalNet>();
+  for (const net of nets) {
+    netMap.set(net.id, net);
   }
 
-  // Collect old → new port-reference renames.
-  const portRename = new Map<string, string>();
+  // Gather every commutative group, pulling its entries out of
+  // comp.connections so each round reassigns from a clean base.
+  type Entry = { originalRef: string; netId: string };
+  type Group = {
+    comp: CanonicalComponent;
+    isSingleBase: boolean;
+    baseName: string;
+    names: string[];
+    entries: Entry[];
+  };
 
+  const groups: Group[] = [];
   for (const comp of canonicalComponents) {
-    const groups = COMMUTATIVE_PORT_GROUPS[comp.type];
-    if (!groups) continue;
+    const portGroups = COMMUTATIVE_PORT_GROUPS[comp.type];
+    if (!portGroups) continue;
 
-    groupLoop: for (const group of groups) {
-      const isSingleBase = group.length === 1;
-
-      // Gather every port that belongs to this group.
-      const entries: { portName: string; netId: string }[] = [];
+    for (const g of portGroups) {
+      const isSingleBase = g.length === 1;
+      const entries: Entry[] = [];
       for (const portName of Object.keys(comp.connections)) {
         const inGroup = isSingleBase
-          ? portName === group[0] || portName.startsWith(group[0] + "_")
-          : group.includes(portName);
+          ? portName === g[0] || portName.startsWith(g[0] + "_")
+          : g.includes(portName);
         if (inGroup) {
-          entries.push({ portName, netId: comp.connections[portName] });
+          entries.push({
+            originalRef: `${comp.id}.${portName}`,
+            netId: comp.connections[portName],
+          });
           delete comp.connections[portName];
         }
       }
 
       if (entries.length <= 1) {
-        // Put back unchanged.
-        for (const e of entries) comp.connections[e.portName] = e.netId;
-        continue groupLoop;
+        for (const e of entries) {
+          const pn = e.originalRef.substring(e.originalRef.indexOf(".") + 1);
+          comp.connections[pn] = e.netId;
+        }
+        continue;
       }
 
-      // Sort entries so lower port indices receive nets with lower indices.
-      entries.sort((a, b) => {
-        const ai = netIndex.get(a.netId) ?? Infinity;
-        const bi = netIndex.get(b.netId) ?? Infinity;
-        return ai - bi;
-      });
+      groups.push({ comp, isSingleBase, baseName: g[0], names: g, entries });
+    }
+  }
 
-      // Reassign to canonical port names.
-      // Array-port groups (isSingleBase) always use `base_N` naming
-      // to match what buildComponentDrafts generates (inp_0, inp_1…),
-      // avoiding bare name like "inp" that would break import resolution:
-      //   resolvePortNode("comp.inp_0") → instance["inp"][0] ✓
-      //   resolvePortNode("comp.inp")   → instance["inp"] = array ❌
-      for (let i = 0; i < entries.length; i++) {
-        const canonicalName = isSingleBase
-          ? `${group[0]}_${i}`
-          : group[i];
+  // Pre-sort entries within each group by originalRef so the initial order
+  // is deterministic across re-exports.  Without this, a tie in the first
+  // round (identical external signatures) would be broken by stable sort
+  // preserving Object.keys() insertion order, which can differ between the
+  // original load and the canonical import.
+  for (const g of groups) {
+    g.entries.sort((a, b) => naturalCompare(a.originalRef, b.originalRef));
+  }
 
-        // Guard against named-group overflow (should never happen, but
-        // protect against future types with more entries than declared).
+  // currentRef maps each originalRef to the port-ref name CURRENTLY written
+  // in nets[*].connections (starts as the original ref).
+  const currentRef = new Map<string, string>();
+  for (const g of groups) {
+    for (const e of g.entries) {
+      currentRef.set(e.originalRef, e.originalRef);
+    }
+  }
+
+  // Fixed-point iteration.  A single pass can be order-dependent when two
+  // commutative components are wired directly to each other (e.g. a
+  // ripple-carry Adder chain): the external signature used to break
+  // symmetry can itself reference another not-yet-canonicalised commutative
+  // port.  Re-deriving signatures from the CURRENT net contents and
+  // repeating until nothing changes converges to a unique,
+  // order-independent result — the same style of fixed point wlFingerprint
+  // already uses elsewhere in this file.
+  let changed = true;
+  let iterations = 0;
+  const maxIterations = groups.length + 2;
+
+  while (changed && iterations < maxIterations) {
+    changed = false;
+    iterations++;
+
+    for (const g of groups) {
+      const ranked = g.entries
+        .map((e) => {
+          const myRef = currentRef.get(e.originalRef)!;
+          const net = netMap.get(e.netId);
+          const sig = net
+            ? net.connections
+                .filter((c) => c !== myRef)
+                .sort(naturalCompare)
+                .join(",")
+            : "";
+          return { e, sig };
+        })
+        // Stable sort: a tie means the nets are currently indistinguishable
+        // from this component's perspective — no arbitrary name-based
+        // tiebreak needed; a later round resolves it once a neighbour's own
+        // canonical name is settled.
+        .sort((a, b) => naturalCompare(a.sig, b.sig));
+
+      for (let i = 0; i < ranked.length; i++) {
+        const { e } = ranked[i];
+        const canonicalName = g.isSingleBase
+          ? `${g.baseName}_${i}`
+          : g.names[i];
+
         if (canonicalName === undefined) {
           console.warn(
             `[canonical] normalizeCommutativePorts: ` +
-              `${comp.type} has ${entries.length} commutative ports ` +
-              `but only ${group.length} names declared; keeping original.`,
+              `${g.comp.type} has ${ranked.length} commutative ports ` +
+              `but only ${g.names.length} names declared; keeping original.`,
           );
-          comp.connections[entries[i].portName] = entries[i].netId;
           continue;
         }
 
-        comp.connections[canonicalName] = entries[i].netId;
-
-        const oldRef = `${comp.id}.${entries[i].portName}`;
-        const newRef = `${comp.id}.${canonicalName}`;
+        const oldRef = currentRef.get(e.originalRef)!;
+        const newRef = `${g.comp.id}.${canonicalName}`;
         if (oldRef !== newRef) {
-          portRename.set(oldRef, newRef);
+          // Update only the net this port actually connects to.
+          // Searching all nets would be wrong: when this round's
+          // previous rank already renamed another commutative port
+          // on a different net to the same string as this oldRef,
+          // a global search would match the wrong net and corrupt
+          // the wiring (the two ports would cross-connect).
+          const targetNet = netMap.get(e.netId);
+          if (targetNet) {
+            const idx = targetNet.connections.indexOf(oldRef);
+            if (idx !== -1) {
+              targetNet.connections[idx] = newRef;
+              changed = true;
+            }
+          }
+          currentRef.set(e.originalRef, newRef);
         }
+      }
+    }
+
+    // Keep net member lists sorted between rounds so signature derivation
+    // sees deterministic order.
+    for (const net of nets) {
+      net.connections.sort(naturalCompare);
+    }
+  }
+
+  if (iterations >= maxIterations) {
+    console.warn(
+      `[canonical] normalizeCommutativePorts: did not converge after ` +
+        `${maxIterations} iterations`,
+    );
+  }
+
+  // Write final canonical names back onto each component.
+  const portRename = new Map<string, string>();
+  for (const g of groups) {
+    for (const e of g.entries) {
+      const finalRef = currentRef.get(e.originalRef)!;
+      const finalPortName = finalRef.substring(finalRef.indexOf(".") + 1);
+      g.comp.connections[finalPortName] = e.netId;
+      if (finalRef !== e.originalRef) {
+        portRename.set(e.originalRef, finalRef);
       }
     }
   }
 
-  // Apply rename map to every net's member list.
   for (const net of nets) {
-    for (let i = 0; i < net.connections.length; i++) {
-      const renamed = portRename.get(net.connections[i]);
-      if (renamed) net.connections[i] = renamed;
-    }
     net.connections.sort(naturalCompare);
   }
 
-  return portRename;
+  // ── Phase 2: sort & renumber nets by canonical member list ───────────
+  nets.sort((a, b) =>
+    naturalCompare(a.connections.join(","), b.connections.join(",")),
+  );
+
+  const netRename = new Map<string, string>();
+  for (let i = 0; i < nets.length; i++) {
+    const oldId = nets[i].id;
+    const newId = `net_${i}`;
+    nets[i].id = newId;
+    if (oldId !== newId) {
+      netRename.set(oldId, newId);
+    }
+  }
+
+  for (const comp of canonicalComponents) {
+    for (const port of Object.keys(comp.connections)) {
+      const newId = netRename.get(comp.connections[port]);
+      if (newId !== undefined) {
+        comp.connections[port] = newId;
+      }
+    }
+  }
+
+  return { portRename, netRename };
 }
 
 function buildCanonicalComponents(
@@ -1007,12 +1154,15 @@ async function sha256(text: string): Promise<string> {
   return hashArray.map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-export async function canonicaliseScope(scope: CVScope): Promise<CanonicalScope> {
+export async function canonicaliseScope(
+  scope: CVScope,
+  childHashes?: Map<number, string>,
+): Promise<CanonicalScope> {
   const nodeIndexMap = indexNodes(scope.allNodes);
   const uf = discoverNets(scope, nodeIndexMap);
 
   const components = buildComponentDrafts(scope, uf, nodeIndexMap);
-  canonicalSort(components);
+  canonicalSort(components, childHashes);
   assignComponentIds(components);
 
   const { netIdMap, netConnections } = assignNetIds(components);
@@ -1033,17 +1183,22 @@ export async function canonicaliseScope(scope: CVScope): Promise<CanonicalScope>
 
   // Normalise commutative gate input assignments so logically equivalent
   // wiring produces the same canonical output and hash.  Operates on
-  // canonicalComponents and nets in-place.  Returns a rename map we also
-  // apply to intermediate-node portConnections so the layout stays consistent.
-  const portRename = normalizeCommutativePorts(canonicalComponents, nets);
-  if (portRename.size > 0 && layout.intermediateNodes) {
-    for (const routing of Object.values(layout.intermediateNodes)) {
+  // canonicalComponents and nets in-place.  Returns rename maps we also
+  // apply to intermediate-node portConnections and net keys so that the
+  // layout stays consistent with the netlist.
+  const { portRename, netRename } = normalizeCommutativePorts(canonicalComponents, nets);
+  if (layout.intermediateNodes && (portRename.size > 0 || netRename.size > 0)) {
+    const rekeyed: Record<string, IntermediateNet> = {};
+    for (const [oldNetId, routing] of Object.entries(layout.intermediateNodes)) {
+      const newNetId = netRename.get(oldNetId) ?? oldNetId;
       for (const pc of routing.portConnections) {
         const renamed = portRename.get(pc.portRef);
         if (renamed) pc.portRef = renamed;
       }
       routing.portConnections.sort((a, b) => naturalCompare(a.portRef, b.portRef));
+      rekeyed[newNetId] = routing;
     }
+    layout.intermediateNodes = rekeyed;
   }
 
   const netlist = { components: canonicalComponents, nets };
@@ -1060,6 +1215,17 @@ export async function canonicaliseScope(scope: CVScope): Promise<CanonicalScope>
         if (params.length > 0) {
           params[0] = null;
         }
+        // Null layoutProperties (index 2) for Input/Output to avoid layout positioning/ID differences breaking determinism.
+        if ((c.type === "Input" || c.type === "Output") && params.length > 2) {
+          params[2] = null;
+        }
+        comp = { ...comp, properties: { ...comp.properties, constructorParamaters: params } };
+      }
+      // Replace numeric child scope ID in SubCircuit constructorParamaters with child's canonical hash for stability across sessions.
+      if (c.type === "SubCircuit" && Array.isArray(comp.properties?.constructorParamaters)) {
+        const params = (comp.properties.constructorParamaters as unknown[]).slice();
+        const childId = Number(params[0]);
+        params[0] = (!isNaN(childId) && childHashes?.get(childId)) ?? params[0];
         comp = { ...comp, properties: { ...comp.properties, constructorParamaters: params } };
       }
       return comp;
@@ -1086,7 +1252,7 @@ export async function canonicaliseScope(scope: CVScope): Promise<CanonicalScope>
   };
 
   const projectMetadata = {
-    id: scope.id,
+    id: String(scope.id),
     name: scope.name || "Untitled",
     timeStamp: scope.timeStamp || null,
     restrictedElementsUsed: scope.restrictedCircuitElementsUsed || [],
@@ -1103,7 +1269,7 @@ export async function canonicaliseScope(scope: CVScope): Promise<CanonicalScope>
   };
 }
 
-function khansAlgorithm(
+export function khansAlgorithm(
   indegreeMap: Map<number, number>,
   dependents: Map<number, number[]>,
 ): number[] | null {
@@ -1127,7 +1293,9 @@ function khansAlgorithm(
       indegreeMap.set(dep, newIndegree);
       if (newIndegree === 0) {
         queue.push(dep);
-        queue.sort((a, b) => a - b);
+        const tail = queue.splice(head);
+        tail.sort((a, b) => a - b);
+        queue.push(...tail);
       }
     }
   }
@@ -1143,40 +1311,45 @@ export async function canonicaliseProject(
   const circuitHashes: string[] = [];
   const inDegreeMap = new Map<number, number>();
   const dependents = new Map<number, number[]>();
-  const scopeIds = new Set(scopes.map((scope) => Number(scope?.id)).filter((id) => !isNaN(id)));
+  const scopeById = new Map<number, CVScope>();
 
-  for (let i = 0; i < scopes.length; i++) {
-    const scope = scopes[i];
-    if (!scope || !scope.allNodes) continue;
+  for (const scope of scopes) {
+    if (!scope || scope.id === undefined || !scope.allNodes) continue;
+    const id = Number(scope.id);
+    inDegreeMap.set(id, 0);
+    dependents.set(id, []);
+    scopeById.set(id, scope);
+  }
 
-    const circuitId = Number(scope.id);
-    if (!dependents.has(circuitId)) dependents.set(circuitId, []);
+  for (const [id, scope] of scopeById) {
+    const subCircuits = scope["SubCircuit"] as Array<Record<string, unknown>> | undefined;
+    if (!subCircuits) continue;
 
-    const circuit = await canonicaliseScope(scope);
-
-    const subcircuitRefs = [
-      ...new Set(
-        circuit.netlist.components
-          .filter((c) => c.type === "SubCircuit")
-          .map((c) => Number((c.properties.constructorParamaters as unknown[])?.[0]))
-          .filter((id) => !isNaN(id) && scopeIds.has(id) && id !== circuitId),
-      ),
-    ];
-
-    for (const targetId of subcircuitRefs) {
-      if (!dependents.has(targetId)) dependents.set(targetId, []);
-      dependents.get(targetId)!.push(circuitId);
+    let indegree = 0;
+    for (const sub of subCircuits) {
+      const targetId = Number(sub.id);
+      if (!isNaN(targetId) && inDegreeMap.has(targetId)) {
+        indegree++;
+        dependents.get(targetId)!.push(id);
+      }
     }
-
-    inDegreeMap.set(circuitId, subcircuitRefs.length);
-    pairs.set(circuitId, circuit);
-    circuitHashes.push(circuit.canonicalHash);
+    inDegreeMap.set(id, indegree);
   }
 
   const topologicalOrder = khansAlgorithm(inDegreeMap, dependents);
-
   if (!topologicalOrder) {
     throw new Error("A cyclic dependency was detected among the subcircuits!");
+  }
+
+  const childHashes = new Map<number, string>();
+  for (const id of topologicalOrder) {
+    const scope = scopeById.get(id);
+    if (!scope) continue;
+
+    const circuit = await canonicaliseScope(scope, childHashes);
+    pairs.set(id, circuit);
+    childHashes.set(id, circuit.canonicalHash);
+    circuitHashes.push(circuit.canonicalHash);
   }
 
   const circuits: Record<number, CanonicalScope> = {};
