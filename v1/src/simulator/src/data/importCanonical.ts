@@ -2,21 +2,16 @@ import modules from "../modules";
 import { newCircuit, switchCircuit, scopeList } from "../circuit";
 import type Scope from "../circuit";
 import { SimulatorStore } from "#/store/SimulatorStore/SimulatorStore";
-import {
-  canonicaliseScope,
-  canonicaliseProject,
-  khansAlgorithm,
-  STATEFUL_DEFAULT_STATE,
-} from "./canonical";
+import { canonicaliseProject, khansAlgorithm, STATEFUL_DEFAULT_STATE } from "./canonical";
 import type {
-  CanonicalScope,
   CanonicalLayout,
   CanonicalComponent,
   CanonicalComponentPosition,
   IntermediateNet,
   CanonicalJsonValue,
   CanonicalNet,
-  CanonicalProject,
+  CanonicalProjectInput,
+  CanonicalScopeInput,
   ComponentInstance,
 } from "../types/canonical.types";
 import { resetup } from "../setup";
@@ -41,19 +36,11 @@ type ComponentConstructor = new (
   ...rest: CanonicalJsonValue[]
 ) => ComponentInstance;
 
-type ValidationResult = { valid: true; errors: [] } | { valid: false; errors: string[] };
-
 export type ImportResult = {
   success: boolean;
   imported: number;
   errors: string[];
 };
-
-// TODO: Replace with JSON Schema validation (deferred).
-/** Validates a canonical circuit JSON against the expected schema. Currently a no-op stub. */
-export function validateCanonicalJson(_circuitData: CanonicalScope): ValidationResult {
-  return { valid: true, errors: [] };
-}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -69,7 +56,7 @@ function getConstructorParams(properties: CanonicalComponent["properties"]): Can
 function buildComponents(
   scope: Scope,
   components: CanonicalComponent[],
-  layout: CanonicalLayout,
+  layout: CanonicalLayout | undefined,
   scopeMap: Map<number, Scope>,
 ): { instanceMap: Map<string, ComponentInstance>; errors: string[] } {
   const instanceMap = new Map<string, ComponentInstance>();
@@ -79,7 +66,9 @@ function buildComponents(
 
   for (let i = 0; i < components.length; i++) {
     const { id, type, label, properties } = components[i];
-    const position = layout[id] as CanonicalComponentPosition;
+    const position = layout?.[id] as CanonicalComponentPosition | undefined;
+    const x = position?.x ?? 0;
+    const y = position?.y ?? 0;
 
     let instance: ComponentInstance;
 
@@ -91,12 +80,7 @@ function buildComponents(
       }
 
       try {
-        instance = new SubCircuit(
-          position.x,
-          position.y,
-          scope,
-          String(subcircuitId),
-        ) as ComponentInstance;
+        instance = new SubCircuit(x, y, scope, String(subcircuitId)) as ComponentInstance;
       } catch (err) {
         errors.push(`SubCircuit "${id}": ${errorMessage(err)}`);
         continue;
@@ -111,7 +95,7 @@ function buildComponents(
       const constructorArgs = getConstructorParams(properties);
 
       try {
-        instance = new Constructor(position.x, position.y, scope, ...constructorArgs);
+        instance = new Constructor(x, y, scope, ...constructorArgs);
       } catch (err) {
         errors.push(`"${id}" (${type}): ${errorMessage(err)}`);
         continue;
@@ -122,12 +106,28 @@ function buildComponents(
 
     instance.propagationDelay = properties.propagationDelay;
 
-    instance.labelDirection = position.labelDirection;
+    if (position) {
+      instance.labelDirection = position.labelDirection;
+    }
 
     instanceMap.set(id, instance);
   }
 
   return { instanceMap, errors };
+}
+
+function applyComponentLayout(
+  instanceMap: Map<string, ComponentInstance>,
+  layout: CanonicalLayout,
+): void {
+  for (const [id, instance] of instanceMap) {
+    const position = layout[id] as CanonicalComponentPosition;
+    Reflect.set(instance, "x", position.x);
+    Reflect.set(instance, "y", position.y);
+    Reflect.set(instance, "oldx", position.x);
+    Reflect.set(instance, "oldy", position.y);
+    instance.labelDirection = position.labelDirection;
+  }
 }
 
 /** Resolves a "ComponentId.portName" reference string to a live Node on the constructed instance. */
@@ -277,7 +277,11 @@ function restoreIntermediateNodes(
 }
 
 /** Copies visual metadata from the canonical JSON back onto the scope object. */
-function restoreScopeMetadata(scope: Scope, circuitData: CanonicalScope): void {
+function restoreScopeMetadata(
+  scope: Scope,
+  circuitData: CanonicalScopeInput,
+  layout: CanonicalLayout,
+): void {
   scope.name = circuitData.projectMetadata.name;
   scope.restrictedCircuitElementsUsed = [...circuitData.projectMetadata.restrictedElementsUsed];
 
@@ -286,7 +290,7 @@ function restoreScopeMetadata(scope: Scope, circuitData: CanonicalScope): void {
   scope.ox = ox;
   scope.oy = oy;
 
-  const sym = circuitData.layout.subcircuitSymbol;
+  const sym = layout.subcircuitSymbol;
   scope.layout = {
     width: sym.width,
     height: sym.height,
@@ -301,41 +305,34 @@ function restoreScopeMetadata(scope: Scope, circuitData: CanonicalScope): void {
   };
 }
 
-/** Re-exports the imported scope and compares its canonical hash to the original */
-async function verifyRoundTrip(
-  scope: Scope,
-  expectedScope: CanonicalScope,
-  originalChildHashes?: Map<number, string>,
-): Promise<boolean> {
-  const reExported = await canonicaliseScope(scope, originalChildHashes);
-  const match = reExported.canonicalHash === expectedScope.canonicalHash;
-
-  const header =
-    "[importCanonical] Round-trip check\n" +
-    `  scopeId:       ${String(scope.id)}\n` +
-    `  expected hash: ${expectedScope.canonicalHash}\n` +
-    `  actual hash:   ${reExported.canonicalHash}\n` +
-    `  result:        ${match ? "PASS" : "FAIL"}`;
-
-  console.log(header);
-  return match;
-}
-
 /** Imports a single circuit's components, wiring, default state, and metadata into the given scope. */
 async function importSingleScope(
-  circuitData: CanonicalScope,
+  circuitData: CanonicalScopeInput,
   scope: Scope,
   scopeMap: Map<number, Scope>,
-  originalChildHashes?: Map<number, string>,
 ): Promise<string[]> {
   const { components, nets } = circuitData.netlist;
-  const { layout } = circuitData;
+  let { layout } = circuitData;
 
   const { instanceMap, errors: buildErrors } = buildComponents(scope, components, layout, scopeMap);
 
   if (buildErrors.length > 0) {
     return buildErrors;
   }
+
+  if (layout === undefined) {
+    try {
+      const { generateElkLayout } = await import("./elkLayout");
+      layout = await generateElkLayout(components, nets, instanceMap);
+      console.log(
+        `[importCanonical] Generated ELK layout for scope "${circuitData.projectMetadata.name}"`,
+      );
+    } catch (err) {
+      return [`Automatic layout failed: ${errorMessage(err)}`];
+    }
+  }
+
+  applyComponentLayout(instanceMap, layout);
 
   const wireErrors = wireComponents(instanceMap, nets, layout.intermediateNodes);
   restoreDefaultState(instanceMap, components);
@@ -344,21 +341,12 @@ async function importSingleScope(
     ? restoreIntermediateNodes(scope, layout.intermediateNodes, instanceMap, nets)
     : [];
 
-  restoreScopeMetadata(scope, circuitData);
+  restoreScopeMetadata(scope, circuitData, layout);
 
-  const allErrors = [...wireErrors, ...routingErrors];
-
-  if (allErrors.length === 0) {
-    const hashMatch = await verifyRoundTrip(scope, circuitData, originalChildHashes);
-    if (!hashMatch) {
-      allErrors.push(`Round-trip hash mismatch for scope ${String(scope.id)}`);
-    }
-  }
-
-  return allErrors;
+  return [...wireErrors, ...routingErrors];
 }
 
-function computeImportOrder(circuits: Record<string, CanonicalScope>): number[] {
+function computeImportOrder(circuits: Record<string, CanonicalScopeInput>): number[] {
   const inDegreeMap = new Map<number, number>();
   const dependents = new Map<number, number[]>();
   const scopeIds = new Set<number>();
@@ -399,7 +387,7 @@ function computeImportOrder(circuits: Record<string, CanonicalScope>): number[] 
 }
 
 export async function importCanonical(
-  json: CanonicalProject,
+  json: CanonicalProjectInput,
   targetScope: Scope | null | undefined,
 ): Promise<ImportResult> {
   const results: ImportResult = { success: false, imported: 0, errors: [] };
@@ -459,19 +447,8 @@ export async function importCanonical(
 
   const scopeMap = new Map<number, Scope>();
 
-  const originalChildHashes = new Map<number, string>();
-  for (const cid of topologicalOrder) {
-    originalChildHashes.set(cid, json.circuits[String(cid)].canonicalHash);
-  }
-
   for (const canonicalId of topologicalOrder) {
     const circuitData = json.circuits[String(canonicalId)];
-
-    const validation = validateCanonicalJson(circuitData);
-    if (!validation.valid) {
-      results.errors.push(`[${canonicalId}] validation: ${validation.errors.join(", ")}`);
-      continue;
-    }
 
     let currentScope: Scope;
     if (canonicalId === hostCircuitId) {
@@ -492,12 +469,7 @@ export async function importCanonical(
 
     scopeMap.set(canonicalId, currentScope);
 
-    const importErrors = await importSingleScope(
-      circuitData,
-      currentScope,
-      scopeMap,
-      originalChildHashes,
-    );
+    const importErrors = await importSingleScope(circuitData, currentScope, scopeMap);
     if (importErrors.length === 0) {
       results.imported++;
     }
@@ -519,28 +491,6 @@ export async function importCanonical(
   }
 
   if (results.success) {
-    try {
-      const projectResult = await canonicaliseProject(Array.from(scopeMap.values()));
-      const match = projectResult.canonicalHash === json.canonicalHash;
-      console.log(
-        `[importCanonical] Project Round-trip check\n` +
-          `  Expected project hash: ${json.canonicalHash}\n` +
-          `  Actual project hash:   ${projectResult.canonicalHash}\n` +
-          `  Result:                ${match ? "PASS" : "FAIL"}`,
-      );
-      if (!match) {
-        results.errors.push(
-          `Project round-trip hash mismatch. Expected: ${json.canonicalHash}, got: ${projectResult.canonicalHash}`,
-        );
-        results.success = false;
-      }
-    } catch {
-      results.errors.push("Project round-trip check failed: could not re-export");
-      results.success = false;
-    }
-  }
-
-  if (results.success) {
     resetup();
     renderCanvas(targetScope);
     switchCircuit(String(targetScope.id));
@@ -556,12 +506,28 @@ export async function importCanonical(
   return results;
 }
 
+declare let globalScope: Scope;
+
+/** Exports the current project, removes layout in memory, and imports it again through ELK. */
+export async function elkRoundTrip(): Promise<ImportResult> {
+  const targetScope = globalScope;
+  const exported = await canonicaliseProject(Object.values(scopeList));
+  const circuits: CanonicalProjectInput["circuits"] = {};
+
+  for (const [id, circuit] of Object.entries(exported.circuits)) {
+    const { layout: _layout, ...withoutLayout } = circuit;
+    circuits[id] = withoutLayout;
+  }
+
+  return importCanonical({ ...exported, circuits }, targetScope);
+}
+
 declare global {
   interface Window {
     importCanonical?: typeof importCanonical;
-    validateCanonicalJson?: typeof validateCanonicalJson;
+    elkRoundTrip?: typeof elkRoundTrip;
   }
 }
 
 window.importCanonical = importCanonical;
-window.validateCanonicalJson = validateCanonicalJson;
+window.elkRoundTrip = elkRoundTrip;

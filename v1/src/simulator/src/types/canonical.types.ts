@@ -107,3 +107,13 @@ export interface CanonicalProject {
   canonicalHash: string;
   circuits: Record<string, CanonicalScope>;
 }
+
+/** External canonical scope accepted by the importer before missing layout is generated. */
+export type CanonicalScopeInput = Omit<CanonicalScope, "layout"> & {
+  layout?: CanonicalLayout;
+};
+
+/** External canonical project accepted by the importer. */
+export type CanonicalProjectInput = Omit<CanonicalProject, "circuits"> & {
+  circuits: Record<string, CanonicalScopeInput>;
+};
