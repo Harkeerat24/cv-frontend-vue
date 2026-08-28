@@ -27,6 +27,7 @@ import SubCircuit from "../subcircuit";
 import plotArea from "../plotArea";
 import { simulationArea } from "../simulationArea";
 import { useProjectStore } from "#/store/projectStore";
+import { validateCanonicalJson } from "./validateCanonical";
 
 /** Constructor shared by component classes registered in modules.js. */
 type ComponentConstructor = new (
@@ -36,19 +37,11 @@ type ComponentConstructor = new (
   ...rest: CanonicalJsonValue[]
 ) => ComponentInstance;
 
-type ValidationResult = { valid: true; errors: [] } | { valid: false; errors: string[] };
-
 export type ImportResult = {
   success: boolean;
   imported: number;
   errors: string[];
 };
-
-// TODO: Replace with JSON Schema validation (deferred).
-/** Validates a canonical circuit JSON against the expected schema. Currently a no-op stub. */
-export function validateCanonicalJson(_circuitData: CanonicalScope): ValidationResult {
-  return { valid: true, errors: [] };
-}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -513,54 +506,38 @@ function computeImportOrder(circuits: Record<string, CanonicalScope>): number[] 
   return topologicalOrder;
 }
 
-export async function importCanonical(json: CanonicalProject): Promise<ImportResult> {
+export async function importCanonical(json: unknown): Promise<ImportResult> {
   const results: ImportResult = { success: false, imported: 0, errors: [] };
 
-  if (!json.circuits || typeof json.circuits !== "object") {
-    results.errors.push("Missing circuits object in JSON");
+  const validation = validateCanonicalJson(json);
+  if (!validation.valid) {
+    results.errors.push(...validation.errors);
     return results;
   }
 
-  if (Object.keys(json.circuits).length === 0) {
-    results.errors.push("No circuits found in JSON");
-    return results;
-  }
+  // validateCanonicalJson has checked the complete unmodified payload.
+  const project = json as CanonicalProject;
 
   let topologicalOrder: number[];
   try {
-    topologicalOrder = computeImportOrder(json.circuits);
+    topologicalOrder = computeImportOrder(project.circuits);
   } catch (err) {
     results.errors.push(errorMessage(err));
     return results;
   }
 
-  if (!json.projectMetadata || typeof json.projectMetadata !== "object") {
-    results.errors.push("Missing projectMetadata object in JSON");
-    return results;
-  }
-
-  const hostCircuitId = json.projectMetadata.focussedCircuit;
-  if (!json.circuits[hostCircuitId]) {
-    results.errors.push(`Focused circuit "${hostCircuitId}" was not found`);
-    return results;
-  }
+  const hostCircuitId = project.projectMetadata.focussedCircuit;
 
   resetScopeList();
   const scopeMap = new Map<number, Scope>();
 
   const originalChildHashes = new Map<number, string>();
   for (const cid of topologicalOrder) {
-    originalChildHashes.set(cid, json.circuits[String(cid)].canonicalHash);
+    originalChildHashes.set(cid, project.circuits[String(cid)].canonicalHash);
   }
 
   for (const canonicalId of topologicalOrder) {
-    const circuitData = json.circuits[String(canonicalId)];
-
-    const validation = validateCanonicalJson(circuitData);
-    if (!validation.valid) {
-      results.errors.push(`[${canonicalId}] validation: ${validation.errors.join(", ")}`);
-      continue;
-    }
+    const circuitData = project.circuits[String(canonicalId)];
 
     const currentScope = newCircuit(
       circuitData.projectMetadata.name,
@@ -593,16 +570,16 @@ export async function importCanonical(json: CanonicalProject): Promise<ImportRes
   if (results.success) {
     try {
       const projectResult = await canonicaliseProject(Array.from(scopeMap.values()));
-      const match = projectResult.canonicalHash === json.canonicalHash;
+      const match = projectResult.canonicalHash === project.canonicalHash;
       console.log(
         `[importCanonical] Project Round-trip check\n` +
-          `  Expected project hash: ${json.canonicalHash}\n` +
+          `  Expected project hash: ${project.canonicalHash}\n` +
           `  Actual project hash:   ${projectResult.canonicalHash}\n` +
           `  Result:                ${match ? "PASS" : "FAIL"}`,
       );
       if (!match) {
         results.errors.push(
-          `Project round-trip hash mismatch. Expected: ${json.canonicalHash}, got: ${projectResult.canonicalHash}`,
+          `Project round-trip hash mismatch. Expected: ${project.canonicalHash}, got: ${projectResult.canonicalHash}`,
         );
         results.success = false;
       }
@@ -613,13 +590,13 @@ export async function importCanonical(json: CanonicalProject): Promise<ImportRes
   }
 
   if (results.success) {
-    const order = new Map(json.projectMetadata.orderedTabs.map((id, index) => [id, index]));
+    const order = new Map(project.projectMetadata.orderedTabs.map((id, index) => [id, index]));
     const rank = (id: string | number) => order.get(String(id)) ?? Number.MAX_SAFE_INTEGER;
     const circuitList = SimulatorStore().circuit_list as Array<{ id: string | number }>;
     circuitList.sort((a, b) => rank(a.id) - rank(b.id));
-    useProjectStore().setProjectName(json.projectMetadata.name);
-    simulationArea.changeClockTime(json.projectMetadata.timePeriod);
-    simulationArea.clockEnabled = json.projectMetadata.clockEnabled;
+    useProjectStore().setProjectName(project.projectMetadata.name);
+    simulationArea.changeClockTime(project.projectMetadata.timePeriod);
+    simulationArea.clockEnabled = project.projectMetadata.clockEnabled;
 
     switchCircuit(hostCircuitId);
     updateSimulationSet(true);
